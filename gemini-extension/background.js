@@ -4,7 +4,17 @@
  * NEVER opens tabs, NEVER reloads tabs, NEVER touches window focus.
  */
 
-const DEFAULT_HOST = '127.0.0.1';
+// Candidate server endpoints to auto-discover (Localhost first, then Mac server LAN / ZeroTier / Cluster)
+const CANDIDATE_SERVERS = [
+  '127.0.0.1',      // 1. Same computer (if running on main server)
+  '192.168.1.34',  // 2. Main Mac server (Wi-Fi LAN)
+  '10.56.65.136',  // 3. Main Mac server (ZeroTier VPN)
+  '192.168.1.9',   // 4. K3s Cluster Master (LAN)
+  '10.56.65.169'   // 5. K3s Cluster Master (ZeroTier)
+];
+
+let activeHost = CANDIDATE_SERVERS[0];
+let currentCandidateIndex = 0;
 let ws = null;
 let lastSyncTime = null;
 let hasSyncedOnce = false;
@@ -19,23 +29,20 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 });
 
 async function getServerHost() {
-  const data = await chrome.storage.local.get(['serverHost']);
-  // If stored host is not reachable or empty, default to 127.0.0.1
-  if (data.serverHost && data.serverHost !== DEFAULT_HOST) {
-    // Clean up any stale cluster IP testing artifacts
-    await chrome.storage.local.remove(['serverHost']);
-  }
-  return DEFAULT_HOST;
+  return activeHost;
 }
 
 async function init() {
-  await chrome.storage.local.remove(['serverHost']);
+  const data = await chrome.storage.local.get(['lastWorkingHost', 'lastSyncTime']);
+  if (data.lastWorkingHost && CANDIDATE_SERVERS.includes(data.lastWorkingHost)) {
+    currentCandidateIndex = CANDIDATE_SERVERS.indexOf(data.lastWorkingHost);
+    activeHost = data.lastWorkingHost;
+  }
+  if (data.lastSyncTime) lastSyncTime = data.lastSyncTime;
+
   connectToBackend();
   // Lightweight keep-alive ping every 25 seconds to preserve WebSocket channel
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
-  
-  const data = await chrome.storage.local.get(['lastSyncTime']);
-  if (data.lastSyncTime) lastSyncTime = data.lastSyncTime;
 }
 
 async function connectToBackend() {
@@ -43,22 +50,23 @@ async function connectToBackend() {
     return;
   }
 
-  const host = await getServerHost();
+  const host = CANDIDATE_SERVERS[currentCandidateIndex];
   const wsUrl = `ws://${host}:9226`;
-  console.log('[Gemini Sync] Connecting to backend at:', wsUrl);
+  console.log(`[Gemini Sync] Auto-discovery probing backend at: ${wsUrl}`);
   hasSyncedOnce = false;
 
   try {
     ws = new WebSocket(wsUrl);
   } catch (e) {
-    console.error('[Gemini Sync] WS Connection Error:', e);
-    scheduleReconnect();
+    scheduleNextCandidate();
     return;
   }
 
   ws.onopen = () => {
-    console.log('[Gemini Sync] Connected to Go Backend (Zero-Tab Mode)');
+    activeHost = host;
+    console.log(`[Gemini Sync] Successfully connected to Go Backend on ${host} (Zero-Tab Mode)`);
     chrome.alarms.clear('reconnect');
+    chrome.storage.local.set({ lastWorkingHost: host });
     // Read and push cookies instantly from memory on connect
     performSync();
   };
@@ -76,17 +84,21 @@ async function connectToBackend() {
   };
 
   ws.onclose = () => {
-    console.log('[Gemini Sync] Connection closed. Reconnecting...');
-    scheduleReconnect();
+    console.log(`[Gemini Sync] Connection to ${host} closed. Rotating candidate...`);
+    scheduleNextCandidate();
   };
 
   ws.onerror = (err) => {
-    console.error('[Gemini Sync] WebSocket Error:', err);
+    console.warn(`[Gemini Sync] Server probe failed for ${host}:9226`);
+    try { ws.close(); } catch (_) {}
   };
 }
 
-function scheduleReconnect() {
-  chrome.alarms.create('reconnect', { delayInMinutes: 0.083 }); // ~5s
+function scheduleNextCandidate() {
+  currentCandidateIndex = (currentCandidateIndex + 1) % CANDIDATE_SERVERS.length;
+  // If cycling back to start, pause 3s; otherwise probe next host quickly in 500ms
+  const delaySec = currentCandidateIndex === 0 ? 3 : 0.5;
+  chrome.alarms.create('reconnect', { delayInMinutes: delaySec / 60 });
 }
 
 function keepAlive() {
@@ -219,8 +231,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return true; // async sendResponse
   } else if (msg.type === 'SET_SERVER_HOST') {
-    const newHost = (msg.host || '').trim() || DEFAULT_HOST;
-    chrome.storage.local.set({ serverHost: newHost }).then(() => {
+    const newHost = (msg.host || '').trim() || CANDIDATE_SERVERS[0];
+    activeHost = newHost;
+    chrome.storage.local.set({ lastWorkingHost: newHost }).then(() => {
       if (ws) {
         try { ws.close(); } catch(e) {}
         ws = null;
