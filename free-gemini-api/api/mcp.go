@@ -59,7 +59,7 @@ type CallToolResult struct {
 
 const (
 	mcpServerName    = "free-gemini-mcp"
-	mcpServerVersion = "2.1.0"
+	mcpServerVersion = "2.2.0"
 
 	mcpMaxRetries    = 3
 	mcpBaseRetryWait = 2 * time.Second

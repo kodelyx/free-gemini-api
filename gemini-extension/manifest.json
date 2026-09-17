@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gemini Api Agent",
-  "version": "1.0.0",
+  "version": "2.2.0",
   "description": "Auto-syncs Google Gemini cookies to your local Free Gemini API server",
   "permissions": ["cookies", "storage", "alarms", "clipboardWrite"],
   "host_permissions": [
