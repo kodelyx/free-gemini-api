@@ -4,6 +4,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const lastSync = document.getElementById('last-sync');
   const syncBtn = document.getElementById('sync-btn');
 
+  const serverHostInput = document.getElementById('server-host-input');
+  const saveHostBtn = document.getElementById('save-host-btn');
+  const chips = document.querySelectorAll('.chip');
+
   function updateUI() {
     chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (response) => {
       if (chrome.runtime.lastError) return;
@@ -25,8 +29,43 @@ document.addEventListener('DOMContentLoaded', () => {
       } else {
         lastSync.innerText = 'Never';
       }
+
+      if (response.serverHost && document.activeElement !== serverHostInput) {
+        serverHostInput.value = response.serverHost;
+      }
     });
   }
+
+  function saveHost(hostValue) {
+    const host = (hostValue || serverHostInput.value || '127.0.0.1').trim();
+    serverHostInput.value = host;
+    saveHostBtn.disabled = true;
+    chrome.runtime.sendMessage({ type: 'SET_SERVER_HOST', host }, () => {
+      saveHostBtn.className = 'btn-save saved';
+      saveHostBtn.innerText = 'Saved!';
+      setTimeout(() => {
+        saveHostBtn.className = 'btn-save';
+        saveHostBtn.innerText = 'Save';
+        saveHostBtn.disabled = false;
+        updateUI();
+      }, 1000);
+    });
+  }
+
+  saveHostBtn.addEventListener('click', () => saveHost());
+  serverHostInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') saveHost();
+  });
+
+  chips.forEach(chip => {
+    chip.addEventListener('click', () => {
+      const ip = chip.getAttribute('data-ip');
+      if (ip) {
+        serverHostInput.value = ip;
+        saveHost(ip);
+      }
+    });
+  });
 
   // Initial update
   updateUI();

@@ -4,7 +4,7 @@
  * NEVER opens tabs, NEVER reloads tabs, NEVER touches window focus.
  */
 
-const LOCAL_WS_URL = 'ws://127.0.0.1:9226';
+const DEFAULT_HOST = '127.0.0.1';
 let ws = null;
 let lastSyncTime = null;
 let hasSyncedOnce = false;
@@ -18,6 +18,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'keepAlive') keepAlive();
 });
 
+async function getServerHost() {
+  const data = await chrome.storage.local.get(['serverHost']);
+  return (data.serverHost && data.serverHost.trim()) ? data.serverHost.trim() : DEFAULT_HOST;
+}
+
 async function init() {
   connectToBackend();
   // Lightweight keep-alive ping every 25 seconds to preserve WebSocket channel
@@ -27,16 +32,18 @@ async function init() {
   if (data.lastSyncTime) lastSyncTime = data.lastSyncTime;
 }
 
-function connectToBackend() {
+async function connectToBackend() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
 
-  console.log('[Gemini Sync] Connecting to local backend at:', LOCAL_WS_URL);
+  const host = await getServerHost();
+  const wsUrl = `ws://${host}:9226`;
+  console.log('[Gemini Sync] Connecting to backend at:', wsUrl);
   hasSyncedOnce = false;
 
   try {
-    ws = new WebSocket(LOCAL_WS_URL);
+    ws = new WebSocket(wsUrl);
   } catch (e) {
     console.error('[Gemini Sync] WS Connection Error:', e);
     scheduleReconnect();
@@ -140,24 +147,27 @@ function getFormattedCookies(callback) {
 }
 
 // Performs instantaneous memory extraction and WebSocket/HTTP transfer (< 2ms, ZERO tabs)
-function performSync() {
+async function performSync() {
+  const host = await getServerHost();
   getFormattedCookies((formatted) => {
     // If WebSocket is ready, push via WebSocket
     if (ws && ws.readyState === WebSocket.OPEN) {
-      console.log(`[Gemini Sync] Synchronized ${formatted.length} essential cookies via WebSocket`);
+      console.log(`[Gemini Sync] Synchronized ${formatted.length} essential cookies via WebSocket to ${host}`);
       ws.send(JSON.stringify({
         type: 'cookies_payload',
         cookies: formatted
       }));
     } else {
-      // Dual resilience: push via direct HTTP fallback to local server
-      fetch('http://127.0.0.1:8001/api/sync-cookies', {
+      // Dual resilience: push via direct HTTP fallback to configured server
+      fetch(`http://${host}:8001/api/sync-cookies`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ cookies: formatted })
       }).then(() => {
-        console.log(`[Gemini Sync] Synchronized ${formatted.length} cookies via HTTP Fallback`);
-      }).catch(() => {});
+        console.log(`[Gemini Sync] Synchronized ${formatted.length} cookies via HTTP Fallback to http://${host}:8001`);
+      }).catch((e) => {
+        console.warn(`[Gemini Sync] HTTP Fallback failed to ${host}:`, e);
+      });
       
       connectToBackend();
     }
@@ -193,11 +203,26 @@ chrome.cookies.onChanged.addListener((changeInfo) => {
 // Receive message from Popup
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'GET_STATUS') {
-    sendResponse({
-      connected: ws && ws.readyState === WebSocket.OPEN,
-      lastSyncTime,
-      hasSyncedOnce
+    getServerHost().then((host) => {
+      sendResponse({
+        connected: ws && ws.readyState === WebSocket.OPEN,
+        lastSyncTime,
+        hasSyncedOnce,
+        serverHost: host
+      });
     });
+    return true; // async sendResponse
+  } else if (msg.type === 'SET_SERVER_HOST') {
+    const newHost = (msg.host || '').trim() || DEFAULT_HOST;
+    chrome.storage.local.set({ serverHost: newHost }).then(() => {
+      if (ws) {
+        try { ws.close(); } catch(e) {}
+        ws = null;
+      }
+      connectToBackend();
+      sendResponse({ ok: true, host: newHost });
+    });
+    return true; // async sendResponse
   } else if (msg.type === 'FORCE_SYNC') {
     performSync();
     sendResponse({ ok: true });
