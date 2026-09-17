@@ -64,13 +64,15 @@ SAMPLE USAGE:
   # 4. Check Cluster Status:
   curl -s http://127.0.0.1:8001/v1/workers
 
-CLI COMMANDS:
+CLI COMMANDS & MODES:
   ./goapi                     Start the API server daemon (Port 8001 & WS 9226)
   ./goapi --help              Display this CLI help manual
   ./goapi --stats             Print instant SQLite database analytics in terminal
   ./goapi --export out.json   Export database analytics to JSON file
   ./goapi --export out.xlsx   Export database analytics to Excel spreadsheet
   ./goapi --mcp               Start as an MCP (Model Context Protocol) stdio server
+                              Supported Tools: chat, generate_image, generate_video,
+                              generate_music, check_health, reset_session
 `
 }
 
@@ -102,6 +104,7 @@ func HandleHelp(c fiber.Ctx) error {
 			},
 			"multi_agent_headers": []string{"X-Agent-ID", "X-Session-ID", "X-Conversation-ID"},
 			"tools":               []string{"needle2_function_calling", "multimodal_vision", "gemini_music_lyria", "multi_account_queue"},
+			"mcp_tools":           []string{"chat", "generate_image", "generate_video", "generate_music", "check_health", "reset_session"},
 		})
 	}
 
