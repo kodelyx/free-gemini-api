@@ -14,7 +14,18 @@
 
 ---
 
-## ✨ What's New — v2.1 Multi-Agent Worker Queue Engine
+## ✨ What's New — v2.2 Autonomous Network Discovery & Gemini 3.8 Flash
+
+### 🌐 Autonomous Zero-Config Multi-Device Discovery
+- **Multi-Device Cookie Accumulation**: Run the Chrome extension on any device (Mac, Windows, Ubuntu, K3s cluster nodes) across local Wi-Fi (`192.168.1.x`) and ZeroTier VPN (`10.56.65.x`).
+- **Autonomous Multi-Tier Discovery Engine**: Automatically scans localhost (`127.0.0.1`), mDNS hostnames (`macbookpro.local`), and local subnets in parallel chunks (<300ms) to lock onto the central Go server with zero manual IP setup.
+- **Self-Healing & Auto-Cache**: Automatically remembers working server IPs and re-probes if the host moves to a new IP.
+- **Strict Gemini 3.8 Flash Model**: 100% standardized across all chat handlers, CLI tools, and OpenAI completion endpoints.
+- **Interactive CLI Help Manual**: Built-in developer guide available directly via `GET /help`, `GET /`, or `./goapi --help`.
+
+---
+
+## ✨ Features from v2.1 (Multi-Agent Worker Queue Engine)
 
 ### 🚀 Parallel Multi-Account Worker Pool (`queue.go`)
 - **Dynamic 1 to 100+ Account Auto-Scaling**: Discovers all Google accounts in `cookies/` and boots them as concurrent workers.
