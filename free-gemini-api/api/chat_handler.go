@@ -376,10 +376,22 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		}
 	}
 
-	sessionID := c.IP()
-	client, err := GetOrCreateClient(sessionID)
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	// Multi-agent & session affinity resolution
+	sessionID := strings.TrimSpace(c.Get("X-Agent-ID"))
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(c.Get("X-Session-ID"))
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(c.Get("X-Conversation-ID"))
+	}
+	if sessionID == "" && req.User != nil {
+		sessionID = strings.TrimSpace(*req.User)
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(c.Query("session_id"))
+	}
+	if sessionID == "" {
+		sessionID = c.IP()
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -391,6 +403,8 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		askPrompt = fullPromptBuilder.String()
 	}
 
+	pool := GetWorkerPool()
+
 	if req.Stream {
 		c.Set("Content-Type", "text/event-stream")
 		c.Set("Cache-Control", "no-cache")
@@ -401,24 +415,27 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 			chunkID := "chatcmpl-" + uuid.NewString()[:12]
 			createdTime := time.Now().Unix()
 
-			_, streamErr := client.AskStream(askPrompt, func(chunk string) {
-				chunkResp := OpenAIChatCompletionChunk{
-					ID:      chunkID,
-					Object:  "chat.completion.chunk",
-					Created: createdTime,
-					Model:   model,
-					Choices: []OpenAIStreamChoice{
-						{
-							Index: 0,
-							Delta: OpenAIDelta{
-								Content: chunk,
+			streamErr := pool.ExecuteQueuedStream(ctx, sessionID, func(cl *gemini.GeminiClient) error {
+				_, err := cl.AskStream(askPrompt, func(chunk string) {
+					chunkResp := OpenAIChatCompletionChunk{
+						ID:      chunkID,
+						Object:  "chat.completion.chunk",
+						Created: createdTime,
+						Model:   model,
+						Choices: []OpenAIStreamChoice{
+							{
+								Index: 0,
+								Delta: OpenAIDelta{
+									Content: chunk,
+								},
 							},
 						},
-					},
-				}
-				data, _ := json.Marshal(chunkResp)
-				fmt.Fprintf(w, "data: %s\n\n", data)
-				w.Flush()
+					}
+					data, _ := json.Marshal(chunkResp)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					w.Flush()
+				})
+				return err
 			})
 
 			if streamErr != nil {
@@ -451,13 +468,12 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		})
 	}
 
-	resp, err := ExecuteWithFailover(sessionID, func(cl *gemini.GeminiClient) (*gemini.GeminiResponse, error) {
+	resp, err := pool.ExecuteQueued(ctx, sessionID, func(cl *gemini.GeminiClient) (*gemini.GeminiResponse, error) {
 		return cl.Ask(askPrompt)
 	})
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			UserSessions.Delete(sessionID)
-			return c.Status(504).JSON(fiber.Map{"error": "Request timed out. Session reset."})
+			return c.Status(504).JSON(fiber.Map{"error": "Request timed out in worker queue."})
 		}
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}

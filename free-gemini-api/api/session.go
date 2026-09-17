@@ -1,14 +1,13 @@
 package api
 
 import (
+	"context"
 	"fmt"
-	"goapi/db"
 	"goapi/gemini"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -95,73 +94,11 @@ func GetOrCreateClientWithFile(sessionID, cookieFilePath string) (*gemini.Gemini
 	return client, nil
 }
 
-// ExecuteWithFailover executes an operation across all active worker accounts in the pool with automatic failover
+// ExecuteWithFailover executes an operation across all active worker accounts using the high-performance WorkerPool
 func ExecuteWithFailover(sessionID string, op func(client *gemini.GeminiClient) (*gemini.GeminiResponse, error)) (*gemini.GeminiResponse, error) {
-	accountFiles := gemini.GetAvailableAccountCookieFiles()
-	if len(accountFiles) == 0 {
-		accountFiles = []string{CookiesFile}
-	}
-
-	var lastErr error
-	var lastResp *gemini.GeminiResponse
-
-	for idx, cFile := range accountFiles {
-		accountSessionID := fmt.Sprintf("%s_acc%d", sessionID, idx)
-		client, err := GetOrCreateClientWithFile(accountSessionID, cFile)
-		if err != nil {
-			lastErr = err
-			log.Printf("⚠️ Worker [%s] init failed: %v", cFile, err)
-			continue
-		}
-
-		resp, opErr := op(client)
-		accID := filepath.Base(cFile)
-		if opErr != nil {
-			// If session expired, auth error, or Google awaiting headers hang, trigger on-demand sync and retry ONCE
-			errStr := strings.ToLower(opErr.Error())
-			isAuthOrExpiry := strings.Contains(errStr, "expired") ||
-				strings.Contains(errStr, "servicelogin") ||
-				strings.Contains(errStr, "snlm0e") ||
-				strings.Contains(errStr, "401") ||
-				strings.Contains(errStr, "awaiting headers") ||
-				strings.Contains(errStr, "context deadline exceeded")
-
-			if isAuthOrExpiry {
-				log.Printf("🚨 Worker [%s] auth/session issue detected: %v. Triggering on-demand cookie sync...", cFile, opErr)
-				gemini.BroadcastCookieRefresh()
-				time.Sleep(2 * time.Second)
-				_ = client.ReloadSession()
-				retryResp, retryErr := op(client)
-				if retryErr == nil {
-					log.Printf("✅ Worker [%s] auto-healed and succeeded on retry!", cFile)
-					_ = db.RecordAccountUsage(accID, cFile, "active")
-					return retryResp, nil
-				}
-				opErr = retryErr
-			}
-
-			_ = db.RecordAccountUsage(accID, cFile, "error")
-			log.Printf("⚠️ Worker [%s] failed with error: %v. Auto-failing over to next worker...", cFile, opErr)
-			lastErr = opErr
-			continue
-		}
-
-		_ = db.RecordAccountUsage(accID, cFile, "active")
-		lastResp = resp
-
-		// If response asks for subscription upgrade (e.g. video) and another account is available, try the next worker!
-		if resp != nil && strings.Contains(resp.Text, "upgrade your subscription") && idx < len(accountFiles)-1 {
-			log.Printf("⚠️ Worker [%s] hit subscription requirement. Auto-failing over to Worker [%s]...", cFile, accountFiles[idx+1])
-			continue
-		}
-
-		return resp, nil
-	}
-
-	if lastResp != nil {
-		return lastResp, nil
-	}
-	return nil, lastErr
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	return GetWorkerPool().ExecuteQueued(ctx, sessionID, op)
 }
 
 func StartWebSocketBridge() {
@@ -178,6 +115,9 @@ func StartWebSocketBridge() {
 			}
 			return true
 		})
+
+		// Reload the multi-account WorkerPool
+		GetWorkerPool().ReloadPool()
 	}
 
 	wsPortStr := os.Getenv("WS_PORT")

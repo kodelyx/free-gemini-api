@@ -14,7 +14,19 @@
 
 ---
 
-## ✨ What's New — v2.0 (Latest)
+## ✨ What's New — v2.1 Multi-Agent Worker Queue Engine
+
+### 🚀 Parallel Multi-Account Worker Pool (`queue.go`)
+- **Dynamic 1 to 100+ Account Auto-Scaling**: Discovers all Google accounts in `cookies/` and boots them as concurrent workers.
+- **True Parallel Multi-Agent Execution**: 10 agents execute 10 queries simultaneously across 10 Google accounts (10x speed, 0 rate limit).
+- **Least-Busy Load Balancing**: Automatically routes incoming requests to the account with the lowest active in-flight load.
+- **Sticky Session Affinity**: Preserves multi-turn conversation context (`c_...`) by mapping `user`, `X-Agent-ID`, or `X-Conversation-ID` to the same account.
+- **Circuit Breaker (429 Protection)**: Auto-quarantines rate-limited accounts for 45s while seamlessly routing traffic to healthy accounts.
+- **Live Worker Metrics**: Real-time monitoring at `GET /v1/workers` and `GET /api/pool`.
+
+---
+
+## ✨ Features from v2.0
 
 ### 🐳 Docker / OrbStack Support
 - **Fully self-contained Docker image** — no host folder dependencies

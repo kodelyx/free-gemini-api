@@ -86,9 +86,10 @@ func main() {
 		return
 	}
 
-	// Start Chrome Extension WebSocket bridge
+	// Start Chrome Extension WebSocket bridge & Multi-Account Worker Pool
 	api.StartWebSocketBridge()
 	gemini.StartCookieWatchdog()
+	api.InitWorkerPool()
 
 	// Initialize Fiber web application
 	app := fiber.New(fiber.Config{

@@ -22,6 +22,14 @@ func RegisterRoutes(app *fiber.App) {
 		})
 	})
 
+	// Live Worker Pool Metrics & Multi-Account concurrency stats
+	app.Get("/v1/workers", func(c fiber.Ctx) error {
+		return c.JSON(GetWorkerPool().GetStats())
+	})
+	app.Get("/api/pool", func(c fiber.Ctx) error {
+		return c.JSON(GetWorkerPool().GetStats())
+	})
+
 	// Direct HTTP Cookie Sync endpoint (dual resilience fallback for Chrome Extension)
 	app.Post("/api/sync-cookies", func(c fiber.Ctx) error {
 		type SyncPayload struct {

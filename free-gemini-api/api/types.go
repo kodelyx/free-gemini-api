@@ -25,6 +25,7 @@ type OpenAIChatCompletionRequest struct {
 	Tools      []map[string]any    `json:"tools,omitempty"`
 	ToolChoice any                 `json:"tool_choice,omitempty"`
 	Stream     bool                `json:"stream"`
+	User       *string             `json:"user,omitempty"`
 }
 
 type OpenAIChoice struct {
