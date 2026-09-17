@@ -295,7 +295,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	}
 
 	model := req.Model
-	if model == "" {
+	if model == "" || strings.Contains(model, "2.5") {
 		model = "gemini-3.8-flash"
 	}
 
