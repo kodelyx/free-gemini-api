@@ -3,11 +3,13 @@
   "name": "Gemini Api Agent",
   "version": "1.0.0",
   "description": "Auto-syncs Google Gemini cookies to your local Free Gemini API server",
-  "permissions": ["cookies", "storage", "alarms", "tabs"],
+  "permissions": ["cookies", "storage", "alarms", "clipboardWrite"],
   "host_permissions": [
     "*://*.google.com/*",
     "*://*.google.co/*",
-    "*://*.googleusercontent.com/*"
+    "*://*.googleusercontent.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
   ],
   "background": {
     "service_worker": "background.js"

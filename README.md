@@ -1,6 +1,6 @@
 # 🔓 Free Gemini API Suite
 
-A complete, high-performance toolkit to use **Google Gemini 3.7 Flash**, **Imagen 3 (8K Images)**, **Cinematic Videos**, and **Music Synthesis** for FREE without API keys or costs.
+A complete, high-performance toolkit to use **Google Gemini 3.8 Flash**, **Imagen 3 (8K Images)**, **Cinematic Videos**, and **Music Synthesis** for FREE without API keys or costs.
 
 ---
 
@@ -37,7 +37,7 @@ go run main.go
 curl -X POST http://localhost:8001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemini-3.7-flash",
+    "model": "gemini-3.8-flash",
     "messages": [{"role": "user", "content": "Explain quantum computing in 1 sentence"}]
   }'
 ```

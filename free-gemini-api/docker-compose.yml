@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  gemini-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: free-gemini-api
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+      - "9226:9226"
+    environment:
+      - TZ=Asia/Kolkata

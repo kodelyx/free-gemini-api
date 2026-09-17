@@ -244,7 +244,7 @@ func getMCPToolDefinitions() map[string]interface{} {
 			},
 			{
 				"name":        "chat",
-				"description": "Chat with Google Gemini 3.7. Supports optional multimodal analysis by attaching local image/video files.",
+				"description": "Chat with Google Gemini 3.8. Supports optional multimodal analysis by attaching local image/video files.",
 				"inputSchema": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{

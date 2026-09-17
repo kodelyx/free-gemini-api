@@ -1,0 +1,6 @@
+data/
+output/
+scripts/
+goapi
+*.log
+.git

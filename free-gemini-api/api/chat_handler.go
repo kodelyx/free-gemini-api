@@ -37,6 +37,30 @@ func FormatOpenAIToolsForNeedle(tools []map[string]any) string {
 	return string(bytes)
 }
 
+// EstimateTokens calculates an accurate token count using word and character heuristics
+func EstimateTokens(text string) int {
+	clean := strings.TrimSpace(text)
+	if clean == "" {
+		return 0
+	}
+	words := len(strings.Fields(clean))
+	runes := len([]rune(clean))
+
+	// Word-based heuristic: ~1.3 tokens per word (standard across English & Code)
+	// Character-based fallback: max(1, (runes + 3) / 4)
+	wTokens := int(float64(words) * 1.3)
+	cTokens := (runes + 3) / 4
+
+	tokens := wTokens
+	if cTokens > tokens {
+		tokens = cTokens
+	}
+	if tokens < 1 {
+		tokens = 1
+	}
+	return tokens
+}
+
 // HandleUnifiedChat handles /chat endpoint (text, images, screen recordings, ref videos)
 func HandleUnifiedChat(c fiber.Ctx) error {
 	var prompt, userID string
@@ -175,6 +199,18 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 			fmt.Fprintf(w, "data: %s\n\n", final)
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			w.Flush()
+
+			userIP := c.IP()
+			go func() {
+				pTokens := CountTokens(prompt)
+				rTokens := CountTokens(streamResp.Text)
+				db.LogMessage(streamResp.ConversationID, sessionID, "user", prompt, "gemini-3.8-flash", pTokens)
+				if streamResp.Text != "" {
+					db.LogMessage(streamResp.ConversationID, sessionID, "assistant", streamResp.Text, "gemini-3.8-flash", rTokens)
+				}
+				db.LogRequest("/chat", "POST", userIP, 200, streamResp.Elapsed*1000)
+				AutoExportAnalytics()
+			}()
 		})
 	}
 
@@ -222,13 +258,15 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 		}
 	}
 
-	// Save to SQLite database asynchronously
+	// Save to SQLite database asynchronously & auto-export Excel
 	userIP := c.IP()
 	hostStr := c.Host()
 	go func() {
-		db.LogMessage(resp.ConversationID, sessionID, "user", prompt, "gemini-3.7-flash", len(prompt)/4)
+		pTokens := CountTokens(prompt)
+		rTokens := CountTokens(resp.Text)
+		db.LogMessage(resp.ConversationID, sessionID, "user", prompt, "gemini-3.8-flash", pTokens)
 		if resp.Text != "" {
-			db.LogMessage(resp.ConversationID, sessionID, "assistant", resp.Text, "gemini-3.7-flash", len(resp.Text)/4)
+			db.LogMessage(resp.ConversationID, sessionID, "assistant", resp.Text, "gemini-3.8-flash", rTokens)
 		}
 		for _, imgURL := range resp.Images {
 			fName := filepath.Base(imgURL)
@@ -239,6 +277,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 			db.LogMediaGeneration("video", prompt, fName, "./output/"+fName, fmt.Sprintf("http://%s/output/%s", hostStr, fName), "16:9", resp.ResponseID)
 		}
 		db.LogRequest("/chat", "POST", userIP, 200, resp.Elapsed*1000)
+		AutoExportAnalytics()
 	}()
 
 	return c.JSON(resp)
@@ -257,7 +296,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 
 	model := req.Model
 	if model == "" {
-		model = "gemini-3.7-flash"
+		model = "gemini-3.8-flash"
 	}
 
 	var prompt string
@@ -403,6 +442,12 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			w.Flush()
+
+			userIP := c.IP()
+			go func() {
+				db.LogRequest("/v1/chat/completions", "POST", userIP, 200, float64(time.Now().Unix()-createdTime)*1000)
+				AutoExportAnalytics()
+			}()
 		})
 	}
 
@@ -418,6 +463,8 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	}
 
 	respContent := resp.Text
+	pTokens := CountTokens(prompt)
+	cTokens := CountTokens(respContent)
 	openAIResp := OpenAIChatCompletionResponse{
 		ID:      "chatcmpl-" + uuid.NewString()[:12],
 		Object:  "chat.completion",
@@ -433,16 +480,22 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 				FinishReason: "stop",
 			},
 		},
+		Usage: &OpenAIUsage{
+			PromptTokens:     pTokens,
+			CompletionTokens: cTokens,
+			TotalTokens:      pTokens + cTokens,
+		},
 	}
 
-	// Save to SQLite database asynchronously
+	// Save to SQLite database asynchronously & auto-export Excel
 	userIP := c.IP()
 	go func() {
-		db.LogMessage(resp.ConversationID, sessionID, "user", prompt, model, len(prompt)/4)
+		db.LogMessage(resp.ConversationID, sessionID, "user", prompt, model, pTokens)
 		if respContent != "" {
-			db.LogMessage(resp.ConversationID, sessionID, "assistant", respContent, model, len(respContent)/4)
+			db.LogMessage(resp.ConversationID, sessionID, "assistant", respContent, model, cTokens)
 		}
 		db.LogRequest("/v1/chat/completions", "POST", userIP, 200, resp.Elapsed*1000)
+		AutoExportAnalytics()
 	}()
 
 	return c.JSON(openAIResp)

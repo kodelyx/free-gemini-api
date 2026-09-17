@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"fmt"
+	"goapi/db"
 	"goapi/gemini"
 	"log"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -71,6 +73,17 @@ func HandleMusic(c fiber.Ctx) error {
 			}
 		}
 		resp.Music = filteredMusic
+
+		// Log to SQLite asynchronously and auto-export Excel
+		userIP := c.IP()
+		go func() {
+			for _, track := range filteredMusic {
+				fName := filepath.Base(track.LocalPath)
+				_ = db.LogMediaGeneration("music", req.Prompt, fName, "./output/"+fName, track.LocalPath, "", resp.ResponseID)
+			}
+			_ = db.LogRequest("/music", "POST", userIP, 200, resp.Elapsed*1000)
+			AutoExportAnalytics()
+		}()
 	}
 
 	return c.JSON(resp)

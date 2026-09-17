@@ -2,9 +2,11 @@ package db
 
 import (
 	"database/sql"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 var (
 	DB   *sql.DB
 	once sync.Once
+	dbMu sync.Mutex
 )
 
 const DBFileName = "data/gemini.db"
@@ -28,7 +31,7 @@ func InitDB() (*sql.DB, error) {
 			return
 		}
 
-		database, err := sql.Open("sqlite", DBFileName+"?_pragma=journal_mode(wal)&_pragma=synchronous(normal)&_pragma=busy_timeout(5000)")
+		database, err := sql.Open("sqlite", DBFileName+"?_pragma=journal_mode(wal)&_pragma=synchronous(normal)&_pragma=busy_timeout(5000)&_pragma=temp_store(memory)")
 		if err != nil {
 			initErr = err
 			return
@@ -106,6 +109,8 @@ func LogMessage(conversationID, userID, role, content, model string, tokens int)
 	if DB == nil {
 		return nil
 	}
+	dbMu.Lock()
+	defer dbMu.Unlock()
 	query := `INSERT INTO messages (conversation_id, user_id, role, content, model, tokens) VALUES (?, ?, ?, ?, ?, ?)`
 	_, err := DB.Exec(query, conversationID, userID, role, content, model, tokens)
 	return err
@@ -116,6 +121,8 @@ func LogMediaGeneration(mediaType, prompt, fileName, filePath, url, aspectRatio,
 	if DB == nil {
 		return nil
 	}
+	dbMu.Lock()
+	defer dbMu.Unlock()
 	query := `INSERT INTO media_generations (type, prompt, file_name, file_path, url, aspect_ratio, response_id) VALUES (?, ?, ?, ?, ?, ?, ?)`
 	_, err := DB.Exec(query, mediaType, prompt, fileName, filePath, url, aspectRatio, responseID)
 	return err
@@ -126,6 +133,8 @@ func LogRequest(endpoint, method, userIP string, statusCode int, elapsedMs float
 	if DB == nil {
 		return nil
 	}
+	dbMu.Lock()
+	defer dbMu.Unlock()
 	query := `INSERT INTO request_logs (endpoint, method, user_ip, status_code, elapsed_ms) VALUES (?, ?, ?, ?, ?)`
 	_, err := DB.Exec(query, endpoint, method, userIP, statusCode, elapsedMs)
 	return err
@@ -234,22 +243,204 @@ func GetMediaByPrompt(mediaType, query string, limit int) ([]map[string]any, err
 	return result, nil
 }
 
-// GetSystemStats returns aggregate statistics from SQLite
+// GetSystemStats returns aggregate statistics and official API cost savings from SQLite
 func GetSystemStats() (map[string]any, error) {
 	if DB == nil {
 		return map[string]any{"status": "database_not_connected"}, nil
 	}
-	var totalMessages, totalMedia, totalRequests int
+	var totalMessages, totalMedia, totalRequests, totalTokens int
+	var totalImages, totalVideos, totalMusic int
+
 	_ = DB.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&totalMessages)
+	_ = DB.QueryRow(`SELECT COALESCE(SUM(tokens), 0) FROM messages`).Scan(&totalTokens)
 	_ = DB.QueryRow(`SELECT COUNT(*) FROM media_generations`).Scan(&totalMedia)
+	_ = DB.QueryRow(`SELECT COUNT(*) FROM media_generations WHERE type='image'`).Scan(&totalImages)
+	_ = DB.QueryRow(`SELECT COUNT(*) FROM media_generations WHERE type='video'`).Scan(&totalVideos)
+	_ = DB.QueryRow(`SELECT COUNT(*) FROM media_generations WHERE type='music'`).Scan(&totalMusic)
 	_ = DB.QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&totalRequests)
 
+	// Official Google Cloud / Vertex AI & Gemini API pricing:
+	// - Gemini Flash Text: $0.50 / 1M tokens ($0.0000005 per token)
+	// - Imagen 3: $0.030 per image
+	// - Video Generation: $1.20 per video
+	// - Music Generation: $0.08 per audio track
+	costSavedUSD := (float64(totalTokens) * 0.0000005) +
+		(float64(totalImages) * 0.030) +
+		(float64(totalVideos) * 1.200) +
+		(float64(totalMusic) * 0.080)
+	usdToINR := GetUSDToINRRate()
+	costSavedINR := costSavedUSD * usdToINR
+
 	return map[string]any{
-		"total_messages":   totalMessages,
-		"total_media":      totalMedia,
-		"total_requests":   totalRequests,
-		"engine":           "SQLite WAL Mode",
-		"database_file":    DBFileName,
+		"total_messages":          totalMessages,
+		"total_tokens":            totalTokens,
+		"total_media":             totalMedia,
+		"total_images":            totalImages,
+		"total_videos":            totalVideos,
+		"total_music":             totalMusic,
+		"total_requests":          totalRequests,
+		"cost_saved_usd":          costSavedUSD,
+		"cost_saved_inr":          costSavedINR,
+		"cost_saved_usd_formatted": fmt.Sprintf("$%.4f", costSavedUSD),
+		"cost_saved_inr_formatted": fmt.Sprintf("₹%.2f", costSavedINR),
+		"engine":                  "SQLite WAL Mode",
+		"database_file":           DBFileName,
 	}, nil
 }
 
+// RecordAccountUsage inserts or updates account status and usage metrics in SQLite
+func RecordAccountUsage(accountID, cookieFile, status string) error {
+	if DB == nil {
+		return nil
+	}
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	query := `
+	INSERT INTO accounts (account_id, cookie_file, status, total_requests, last_used_at)
+	VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+	ON CONFLICT(account_id) DO UPDATE SET
+		cookie_file = excluded.cookie_file,
+		status = excluded.status,
+		total_requests = accounts.total_requests + 1,
+		last_used_at = CURRENT_TIMESTAMP;
+	`
+	_, err := DB.Exec(query, accountID, cookieFile, status)
+	return err
+}
+
+// GetAccounts retrieves all tracked accounts and their usage statistics
+func GetAccounts() ([]map[string]any, error) {
+	if DB == nil {
+		return nil, nil
+	}
+	rows, err := DB.Query(`SELECT account_id, cookie_file, status, total_requests, last_used_at FROM accounts ORDER BY last_used_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var accounts []map[string]any
+	for rows.Next() {
+		var accountID, cookieFile, status, lastUsed string
+		var totalRequests int
+		if err := rows.Scan(&accountID, &cookieFile, &status, &totalRequests, &lastUsed); err == nil {
+			accounts = append(accounts, map[string]any{
+				"account_id":     accountID,
+				"cookie_file":    cookieFile,
+				"status":         status,
+				"total_requests": totalRequests,
+				"last_used_at":   lastUsed,
+			})
+		}
+	}
+	return accounts, nil
+}
+
+// GetAllMessagesForExport fetches messages for Excel and JSON export in chronological order (User first, Assistant next)
+func GetAllMessagesForExport() ([]map[string]any, error) {
+	if DB == nil {
+		return nil, nil
+	}
+	query := `SELECT id, conversation_id, user_id, role, content, model, tokens, created_at FROM messages ORDER BY id ASC LIMIT 5000`
+	rows, err := DB.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []map[string]any
+	for rows.Next() {
+		var id, tokens int
+		var convID, userID, role, content, model, createdAt string
+		if err := rows.Scan(&id, &convID, &userID, &role, &content, &model, &tokens, &createdAt); err == nil {
+			list = append(list, map[string]any{
+				"id":              id,
+				"conversation_id": convID,
+				"user_id":         userID,
+				"role":            role,
+				"content":         content,
+				"model":           model,
+				"tokens":          tokens,
+				"created_at":      createdAt,
+			})
+		}
+	}
+	return list, nil
+}
+
+// GetAllMediaForExport fetches media generations for Excel report generation
+func GetAllMediaForExport() ([]map[string]any, error) {
+	if DB == nil {
+		return nil, nil
+	}
+	query := `SELECT id, type, prompt, file_name, file_path, url, aspect_ratio, response_id, created_at FROM media_generations ORDER BY id DESC LIMIT 5000`
+	rows, err := DB.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []map[string]any
+	for rows.Next() {
+		var id int
+		var mType, prompt, fileName, filePath, urlStr, aspect, respID, createdAt string
+		if err := rows.Scan(&id, &mType, &prompt, &fileName, &filePath, &urlStr, &aspect, &respID, &createdAt); err == nil {
+			list = append(list, map[string]any{
+				"id":           id,
+				"type":         mType,
+				"prompt":       prompt,
+				"file_name":    fileName,
+				"file_path":    filePath,
+				"url":          urlStr,
+				"aspect_ratio": aspect,
+				"response_id":  respID,
+				"created_at":   createdAt,
+			})
+		}
+	}
+	return list, nil
+}
+
+// GetAllRequestLogsForExport fetches request logs for Excel report generation
+func GetAllRequestLogsForExport() ([]map[string]any, error) {
+	if DB == nil {
+		return nil, nil
+	}
+	query := `SELECT id, endpoint, method, user_ip, status_code, elapsed_ms, created_at FROM request_logs ORDER BY id DESC LIMIT 5000`
+	rows, err := DB.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []map[string]any
+	for rows.Next() {
+		var id, status int
+		var endpoint, method, userIP, createdAt string
+		var elapsed float64
+		if err := rows.Scan(&id, &endpoint, &method, &userIP, &status, &elapsed, &createdAt); err == nil {
+			list = append(list, map[string]any{
+				"id":          id,
+				"endpoint":    endpoint,
+				"method":      method,
+				"user_ip":     userIP,
+				"status_code": status,
+				"elapsed_ms":  elapsed,
+				"created_at":  createdAt,
+			})
+		}
+	}
+	return list, nil
+}
+
+// GetUSDToINRRate returns the exchange rate (default: 95.89 INR/USD, configurable via USD_TO_INR env var)
+func GetUSDToINRRate() float64 {
+	rate := 95.89
+	if envRate := os.Getenv("USD_TO_INR"); envRate != "" {
+		if r, err := strconv.ParseFloat(envRate, 64); err == nil && r > 0 {
+			rate = r
+		}
+	}
+	return rate
+}

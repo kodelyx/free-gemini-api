@@ -38,6 +38,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  const copyBtn = document.getElementById('copy-btn');
+
   syncBtn.addEventListener('click', () => {
     syncBtn.disabled = true;
     syncBtn.innerText = 'Syncing...';
@@ -47,6 +49,37 @@ document.addEventListener('DOMContentLoaded', () => {
         syncBtn.innerText = 'Force Sync Cookies';
         updateUI();
       }, 800);
+    });
+  });
+
+  copyBtn.addEventListener('click', () => {
+    copyBtn.disabled = true;
+    copyBtn.innerText = 'Extracting...';
+
+    chrome.runtime.sendMessage({ type: 'GET_FORMATTED_COOKIES' }, async (response) => {
+      if (chrome.runtime.lastError || !response || !response.cookies || response.cookies.length === 0) {
+        copyBtn.innerText = '⚠️ No Cookies Found';
+        setTimeout(() => {
+          copyBtn.disabled = false;
+          copyBtn.innerText = '📋 Copy Cookies';
+        }, 2000);
+        return;
+      }
+
+      const jsonStr = JSON.stringify(response.cookies, null, 2);
+      try {
+        await navigator.clipboard.writeText(jsonStr);
+        copyBtn.className = 'btn-copy success';
+        copyBtn.innerText = `✅ Copied (${response.cookies.length} Cookies)!`;
+      } catch (err) {
+        copyBtn.innerText = '❌ Copy Failed';
+      }
+
+      setTimeout(() => {
+        copyBtn.className = 'btn-copy';
+        copyBtn.disabled = false;
+        copyBtn.innerText = '📋 Copy Cookies';
+      }, 2200);
     });
   });
 });

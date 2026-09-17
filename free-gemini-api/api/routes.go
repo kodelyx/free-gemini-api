@@ -12,11 +12,36 @@ import (
 func RegisterRoutes(app *fiber.App) {
 	// Health check endpoint
 	app.Get("/health", func(c fiber.Ctx) error {
+		cookieHealth := gemini.InspectAccountCookieHealth()
 		return c.JSON(fiber.Map{
 			"status":                   "online",
 			"engine":                   "needle2 + free-gemini-api (pure go)",
+			"cookie_health":            cookieHealth,
 			"active_extension_workers": gemini.GetActiveWorkerCount(),
 			"cookie_accounts_in_pool":  gemini.GetActiveAccountCount(),
+		})
+	})
+
+	// Direct HTTP Cookie Sync endpoint (dual resilience fallback for Chrome Extension)
+	app.Post("/api/sync-cookies", func(c fiber.Ctx) error {
+		type SyncPayload struct {
+			Cookies []gemini.CookieObject `json:"cookies"`
+		}
+		var payload SyncPayload
+		if err := c.Bind().JSON(&payload); err != nil || len(payload.Cookies) == 0 {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid cookies payload"})
+		}
+
+		filePath, accID, err := gemini.ProcessAndSaveCookies(payload.Cookies)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		return c.JSON(fiber.Map{
+			"status":     "success",
+			"account_id": accID,
+			"file_path":  filePath,
+			"count":      len(payload.Cookies),
 		})
 	})
 
@@ -25,6 +50,7 @@ func RegisterRoutes(app *fiber.App) {
 		return c.JSON(fiber.Map{
 			"object": "list",
 			"data": []fiber.Map{
+				{"id": "gemini-3.8-flash", "object": "model", "owned_by": "free-gemini-api"},
 				{"id": "gemini-3.7-flash", "object": "model", "owned_by": "free-gemini-api"},
 			},
 		})
@@ -150,8 +176,16 @@ func RegisterRoutes(app *fiber.App) {
 		}
 		stats["active_accounts"] = gemini.GetActiveAccountCount()
 		stats["active_workers"] = gemini.GetActiveWorkerCount()
+		stats["cookie_health"] = gemini.InspectAccountCookieHealth()
 		return c.JSON(stats)
 	})
+
+	// Machine-readable JSON Analytics endpoint (Direct REST API)
+	app.Get("/v1/analytics", HandleJSONExport)
+	app.Get("/export/json", HandleJSONExport)
+
+	// Excel Analytics & Intelligence Exporter
+	app.Get("/export/excel", HandleExcelExport)
 
 	// Static generated output files (images, videos, music)
 	app.Get("/output/*", func(c fiber.Ctx) error {

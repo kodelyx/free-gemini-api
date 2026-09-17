@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"goapi/db"
 	"goapi/gemini"
 	"log"
 	"os"
@@ -51,10 +52,20 @@ func DownloadAndClean(client *gemini.GeminiClient, urlStr, filename, fileType st
 }
 
 func GetOrCreateClient(sessionID string) (*gemini.GeminiClient, error) {
+	if available := gemini.GetAvailableAccountCookieFiles(); len(available) > 0 {
+		return GetOrCreateClientWithFile(sessionID, available[0])
+	}
 	return GetOrCreateClientWithFile(sessionID, CookiesFile)
 }
 
 func GetOrCreateClientWithFile(sessionID, cookieFilePath string) (*gemini.GeminiClient, error) {
+	// If the requested path doesn't exist, check if an account file is available
+	if _, err := os.Stat(cookieFilePath); os.IsNotExist(err) {
+		if available := gemini.GetAvailableAccountCookieFiles(); len(available) > 0 {
+			cookieFilePath = available[0]
+		}
+	}
+
 	cacheKey := fmt.Sprintf("%s_%s", sessionID, cookieFilePath)
 	if client, ok := UserSessions.Load(cacheKey); ok {
 		return client.(*gemini.GeminiClient), nil
@@ -67,8 +78,10 @@ func GetOrCreateClientWithFile(sessionID, cookieFilePath string) (*gemini.Gemini
 		log.Println("⏳ Sleeping 5 seconds waiting for extension to sync cookies...")
 		time.Sleep(5 * time.Second)
 
-		if _, err := os.Stat(cookieFilePath); os.IsNotExist(err) {
-			return nil, fmt.Errorf("%s not found. Please ensure Chrome Extension is connected and syncs cookies first.", cookieFilePath)
+		if available := gemini.GetAvailableAccountCookieFiles(); len(available) > 0 {
+			cookieFilePath = available[0]
+		} else if _, err := os.Stat(cookieFilePath); os.IsNotExist(err) {
+			return nil, fmt.Errorf("No account cookies found. Please ensure Chrome Extension is connected and syncs cookies first.")
 		}
 	}
 
@@ -102,12 +115,38 @@ func ExecuteWithFailover(sessionID string, op func(client *gemini.GeminiClient) 
 		}
 
 		resp, opErr := op(client)
+		accID := filepath.Base(cFile)
 		if opErr != nil {
+			// If session expired, auth error, or Google awaiting headers hang, trigger on-demand sync and retry ONCE
+			errStr := strings.ToLower(opErr.Error())
+			isAuthOrExpiry := strings.Contains(errStr, "expired") ||
+				strings.Contains(errStr, "servicelogin") ||
+				strings.Contains(errStr, "snlm0e") ||
+				strings.Contains(errStr, "401") ||
+				strings.Contains(errStr, "awaiting headers") ||
+				strings.Contains(errStr, "context deadline exceeded")
+
+			if isAuthOrExpiry {
+				log.Printf("🚨 Worker [%s] auth/session issue detected: %v. Triggering on-demand cookie sync...", cFile, opErr)
+				gemini.BroadcastCookieRefresh()
+				time.Sleep(2 * time.Second)
+				_ = client.ReloadSession()
+				retryResp, retryErr := op(client)
+				if retryErr == nil {
+					log.Printf("✅ Worker [%s] auto-healed and succeeded on retry!", cFile)
+					_ = db.RecordAccountUsage(accID, cFile, "active")
+					return retryResp, nil
+				}
+				opErr = retryErr
+			}
+
+			_ = db.RecordAccountUsage(accID, cFile, "error")
 			log.Printf("⚠️ Worker [%s] failed with error: %v. Auto-failing over to next worker...", cFile, opErr)
 			lastErr = opErr
 			continue
 		}
 
+		_ = db.RecordAccountUsage(accID, cFile, "active")
 		lastResp = resp
 
 		// If response asks for subscription upgrade (e.g. video) and another account is available, try the next worker!

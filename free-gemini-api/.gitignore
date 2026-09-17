@@ -6,6 +6,7 @@
 gemini-mcp
 gemini-api
 main
+goapi
 
 # Private session cookies (never commit active Google credentials)
 cookies/*.json

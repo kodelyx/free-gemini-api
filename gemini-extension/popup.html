@@ -123,6 +123,45 @@
       transform: translateY(1px);
     }
 
+    .button-group {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .btn-copy {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--text);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: all 0.2s ease;
+      backdrop-filter: blur(10px);
+    }
+
+    .btn-copy:hover {
+      background: rgba(255, 255, 255, 0.14);
+      border-color: rgba(255, 255, 255, 0.3);
+      transform: translateY(-1px);
+    }
+
+    .btn-copy:active {
+      transform: translateY(1px);
+    }
+
+    .btn-copy.success {
+      background: rgba(16, 185, 129, 0.2);
+      border-color: var(--success);
+      color: #34d399;
+    }
+
     .footer {
       text-align: center;
       font-size: 11px;
@@ -151,7 +190,10 @@
       </div>
     </div>
 
-    <button class="btn-sync" id="sync-btn">Force Sync Cookies</button>
+    <div class="button-group">
+      <button class="btn-sync" id="sync-btn">Force Sync Cookies</button>
+      <button class="btn-copy" id="copy-btn">📋 Copy Cookies</button>
+    </div>
 
   </div>
   <script src="popup.js"></script>

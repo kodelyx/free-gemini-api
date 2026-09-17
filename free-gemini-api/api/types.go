@@ -33,12 +33,19 @@ type OpenAIChoice struct {
 	FinishReason string            `json:"finish_reason"`
 }
 
+type OpenAIUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
 type OpenAIChatCompletionResponse struct {
 	ID      string         `json:"id"`
 	Object  string         `json:"object"`
 	Created int64          `json:"created"`
 	Model   string         `json:"model"`
 	Choices []OpenAIChoice `json:"choices"`
+	Usage   *OpenAIUsage   `json:"usage,omitempty"`
 }
 
 type OpenAIDelta struct {
