@@ -167,92 +167,6 @@
       font-size: 11px;
       color: var(--text-muted);
     }
-
-    .config-card {
-      background: var(--card);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      border-radius: 12px;
-      padding: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      backdrop-filter: blur(10px);
-    }
-
-    .config-title {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: var(--text-muted);
-      font-weight: 600;
-    }
-
-    .input-row {
-      display: flex;
-      gap: 8px;
-    }
-
-    .input-row input {
-      flex: 1;
-      background: rgba(0, 0, 0, 0.3);
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      border-radius: 6px;
-      padding: 6px 10px;
-      color: #fff;
-      font-size: 13px;
-      font-family: monospace;
-      outline: none;
-      transition: border-color 0.2s ease;
-    }
-
-    .input-row input:focus {
-      border-color: var(--primary);
-    }
-
-    .btn-save {
-      background: rgba(142, 45, 226, 0.3);
-      border: 1px solid var(--primary);
-      color: #fff;
-      border-radius: 6px;
-      padding: 6px 12px;
-      font-size: 12px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.2s ease;
-    }
-
-    .btn-save:hover {
-      background: var(--primary);
-    }
-
-    .btn-save.saved {
-      background: rgba(16, 185, 129, 0.3);
-      border-color: var(--success);
-      color: #34d399;
-    }
-
-    .chips-row {
-      display: flex;
-      gap: 4px;
-      flex-wrap: wrap;
-    }
-
-    .chip {
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: 4px;
-      padding: 2px 6px;
-      font-size: 10px;
-      color: var(--text-muted);
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-
-    .chip:hover {
-      background: rgba(255, 255, 255, 0.12);
-      color: #fff;
-      border-color: rgba(255, 255, 255, 0.25);
-    }
   </style>
 </head>
 <body>
@@ -273,21 +187,6 @@
       <div class="status-row">
         <span class="status-label">Last Sync</span>
         <span class="status-value" id="last-sync" style="color: var(--text-muted);">Never</span>
-      </div>
-    </div>
-
-    <!-- Server Host Config Section -->
-    <div class="config-card">
-      <div class="config-title">Target Server IP / Host</div>
-      <div class="input-row">
-        <input type="text" id="server-host-input" placeholder="127.0.0.1" spellcheck="false">
-        <button id="save-host-btn" class="btn-save">Save</button>
-      </div>
-      <div class="chips-row">
-        <span class="chip" data-ip="127.0.0.1">Localhost</span>
-        <span class="chip" data-ip="192.168.1.34">Mac (LAN)</span>
-        <span class="chip" data-ip="10.56.65.136">Mac (ZT)</span>
-        <span class="chip" data-ip="10.56.65.169">K3s Master</span>
       </div>
     </div>
 
