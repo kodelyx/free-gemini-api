@@ -20,10 +20,16 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
 async function getServerHost() {
   const data = await chrome.storage.local.get(['serverHost']);
-  return (data.serverHost && data.serverHost.trim()) ? data.serverHost.trim() : DEFAULT_HOST;
+  // If stored host is not reachable or empty, default to 127.0.0.1
+  if (data.serverHost && data.serverHost !== DEFAULT_HOST) {
+    // Clean up any stale cluster IP testing artifacts
+    await chrome.storage.local.remove(['serverHost']);
+  }
+  return DEFAULT_HOST;
 }
 
 async function init() {
+  await chrome.storage.local.remove(['serverHost']);
   connectToBackend();
   // Lightweight keep-alive ping every 25 seconds to preserve WebSocket channel
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
