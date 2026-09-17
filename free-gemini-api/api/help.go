@@ -61,8 +61,24 @@ SAMPLE USAGE:
     -H "Content-Type: application/json" \
     -d '{"model": "gemini-3.8-flash", "messages": [{"role": "user", "content": "Write a poem."}], "stream": true}'
 
-  # 4. Check Cluster Status:
+  # 4. Check Cluster & Worker Pool Status:
   curl -s http://127.0.0.1:8001/v1/workers
+
+  # 5. Generate AI Music (Gemini Lyria):
+  curl -s -X POST http://127.0.0.1:8001/music \
+    -H "Content-Type: application/json" \
+    -d '{"prompt": "Upbeat futuristic synthwave beat with 80s bassline"}'
+
+  # 6. Multimodal Vision / Local Image Analysis:
+  curl -s -X POST http://127.0.0.1:8001/chat \
+    -H "Content-Type: application/json" \
+    -d '{"prompt": "Analyze this screenshot", "ref_image_path": "/path/to/screenshot.png"}'
+
+  # 7. Search Past Conversations (SQLite):
+  curl -s "http://127.0.0.1:8001/history/search?q=quantum"
+
+  # 8. Download Excel Analytics Report:
+  curl -s http://127.0.0.1:8001/export/excel -o analytics_report.xlsx
 
 CLI COMMANDS & MODES:
   ./goapi                     Start the API server daemon (Port 8001 & WS 9226)
