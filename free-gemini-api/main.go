@@ -23,6 +23,12 @@ func main() {
 		log.Println("⚠️  No .env file found, using system environment variables")
 	}
 
+	// Check if invoked with --help or help flag
+	if len(os.Args) > 1 && (os.Args[1] == "--help" || os.Args[1] == "-h" || os.Args[1] == "help") {
+		fmt.Println(api.GetCLIHelpText())
+		return
+	}
+
 	// Check if invoked as MCP stdio server
 	if len(os.Args) > 1 && (os.Args[1] == "--mcp" || os.Args[1] == "-mcp" || os.Args[1] == "mcp") {
 		api.RunMCPServer()

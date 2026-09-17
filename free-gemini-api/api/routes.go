@@ -10,6 +10,10 @@ import (
 
 // RegisterRoutes registers all HTTP API routes onto the Fiber app instance
 func RegisterRoutes(app *fiber.App) {
+	// CLI Help & Developer Manual
+	app.Get("/", HandleHelp)
+	app.Get("/help", HandleHelp)
+
 	// Health check endpoint
 	app.Get("/health", func(c fiber.Ctx) error {
 		cookieHealth := gemini.InspectAccountCookieHealth()
