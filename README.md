@@ -247,6 +247,12 @@ main();
 
 ---
 
+## 🌟 Support & Community
+
+If you find **Gemini 4 Argon Free API** helpful, please give this repository a ⭐ **Star** to support ongoing development and help other developers discover Google's frontier reasoning models!
+
+---
+
 ## 📄 License
 
 MIT License. Developed for the developer and AI research community.
