@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
@@ -70,10 +71,11 @@ var (
 	CurrentChromeUA, CurrentPlatform, CurrentSecChUa = getPlatformDetails()
 )
 
-// Flash model header value (hardcoded since we only use Flash)
-const flashModelID = "56fdd199312815e2"
-
-var flashHeaderValue = fmt.Sprintf(`[1,null,null,null,"%s",null,null,0,[4],null,null,2]`, flashModelID)
+type ModelConversationState struct {
+	ConversationID string `json:"conversation_id"`
+	ResponseID     string `json:"response_id"`
+	ChoiceID       string `json:"choice_id"`
+}
 
 type SavedSessionData struct {
 	SNlM0e         string `json:"snlm0e"`
@@ -81,6 +83,7 @@ type SavedSessionData struct {
 	BL             string `json:"bl"`
 	SavedAt        int64  `json:"saved_at"`
 	RawCookiesHash string `json:"raw_cookies_hash"`
+	AccountTier    string `json:"account_tier,omitempty"`
 }
 
 type GeminiClient struct {
@@ -98,6 +101,58 @@ type GeminiClient struct {
 	IsInitialized  bool
 	RawCookies     string
 	SessionSavedAt int64
+	AccountTier    string // "free" or "subscription"
+	AccountPrefix  string // e.g. "/u/4"
+	convStates     map[string]*ModelConversationState
+	convMu         sync.Mutex
+}
+
+func (c *GeminiClient) getAccountPrefix() string {
+	if c.AccountPrefix != "" {
+		return c.AccountPrefix
+	}
+	if p := os.Getenv("GEMINI_ACCOUNT_PREFIX"); p != "" {
+		c.AccountPrefix = strings.TrimSpace(p)
+		return c.AccountPrefix
+	}
+	if idx := os.Getenv("GEMINI_ACCOUNT_INDEX"); idx != "" {
+		idx = strings.TrimSpace(idx)
+		if strings.HasPrefix(idx, "/u/") {
+			c.AccountPrefix = idx
+		} else {
+			c.AccountPrefix = "/u/" + idx
+		}
+		return c.AccountPrefix
+	}
+	return ""
+}
+
+func (c *GeminiClient) getConvState(modelID string) (string, string, string) {
+	c.convMu.Lock()
+	defer c.convMu.Unlock()
+	if c.convStates == nil {
+		c.convStates = make(map[string]*ModelConversationState)
+	}
+	if state, ok := c.convStates[modelID]; ok && state != nil {
+		return state.ConversationID, state.ResponseID, state.ChoiceID
+	}
+	return c.ConversationID, c.ResponseID, c.ChoiceID
+}
+
+func (c *GeminiClient) updateConvState(modelID, convID, respID, choiceID string) {
+	c.convMu.Lock()
+	defer c.convMu.Unlock()
+	if c.convStates == nil {
+		c.convStates = make(map[string]*ModelConversationState)
+	}
+	c.convStates[modelID] = &ModelConversationState{
+		ConversationID: convID,
+		ResponseID:     respID,
+		ChoiceID:       choiceID,
+	}
+	c.ConversationID = convID
+	c.ResponseID = respID
+	c.ChoiceID = choiceID
 }
 
 type CookieObject struct {
@@ -147,9 +202,11 @@ func NewClient(cookiesFile string) (*GeminiClient, error) {
 	c := &GeminiClient{
 		client:      client,
 		quicClient: quicClient,
-		useQUIC:     true,
+		useQUIC:    false,
 		cookiesFile: cookiesFile,
 		ReqID:       rand.Intn(9000000) + 1000000,
+		convStates:  make(map[string]*ModelConversationState),
+		AccountTier: "free",
 	}
 
 	if err := c.loadCookies(); err != nil {
@@ -160,28 +217,40 @@ func NewClient(cookiesFile string) (*GeminiClient, error) {
 }
 
 func (c *GeminiClient) loadCookies() error {
+	if c.cookiesFile == "" || c.cookiesFile == "guest" {
+		log.Println("🌐 [GeminiClient] Running in Guest/Anonymous mode (no cookies required).")
+		c.AccountTier = "free"
+		return nil
+	}
 	data, err := os.ReadFile(c.cookiesFile)
 	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("ℹ️ [GeminiClient] Cookie file %s not found, falling back to Guest mode.", c.cookiesFile)
+			c.AccountTier = "free"
+			return nil
+		}
 		return err
 	}
+
 
 	// JSON Array Format
 	var cookieList []CookieObject
 	if err := json.Unmarshal(data, &cookieList); err == nil && len(cookieList) > 0 {
 		log.Printf("Loading cookies in JSON array format (%d cookies)", len(cookieList))
+		uGemini, _ := url.Parse("https://gemini.google.com")
 		var rawParts []string
 		for _, ck := range cookieList {
 			domain := strings.TrimPrefix(ck.Domain, ".")
 			u, _ := url.Parse("https://" + domain)
-			c.client.GetCookieJar().SetCookies(u, []*http.Cookie{
-				{
-					Name:   ck.Name,
-					Value:  ck.Value,
-					Domain: ck.Domain,
-					Path:   ck.Path,
-					Secure: ck.Secure,
-				},
-			})
+			cookieObj := &http.Cookie{
+				Name:   ck.Name,
+				Value:  ck.Value,
+				Domain: ck.Domain,
+				Path:   ck.Path,
+				Secure: ck.Secure,
+			}
+			c.client.GetCookieJar().SetCookies(u, []*http.Cookie{cookieObj})
+			c.client.GetCookieJar().SetCookies(uGemini, []*http.Cookie{cookieObj})
 			rawParts = append(rawParts, fmt.Sprintf("%s=%s", ck.Name, ck.Value))
 		}
 		c.RawCookies = strings.Join(rawParts, "; ")
@@ -224,9 +293,13 @@ func parseCookieString(raw, domain string) []*http.Cookie {
 }
 
 func (c *GeminiClient) getSessionCachePath() string {
+	if c.cookiesFile == "" || c.cookiesFile == "guest" {
+		return ""
+	}
 	base := filepath.Base(c.cookiesFile)
 	cleanName := strings.TrimSuffix(base, filepath.Ext(base))
-	return filepath.Join("cookies", fmt.Sprintf("session_%s.json", cleanName))
+	pfx := strings.ReplaceAll(c.getAccountPrefix(), "/", "_")
+	return filepath.Join("cookies", fmt.Sprintf("session_%s%s.json", cleanName, pfx))
 }
 
 func (c *GeminiClient) hashCookies() string {
@@ -236,6 +309,9 @@ func (c *GeminiClient) hashCookies() string {
 
 func (c *GeminiClient) loadCachedSession() bool {
 	cachePath := c.getSessionCachePath()
+	if cachePath == "" {
+		return false
+	}
 	data, err := os.ReadFile(cachePath)
 	if err != nil {
 		return false
@@ -252,15 +328,20 @@ func (c *GeminiClient) loadCachedSession() bool {
 		c.FSID = cached.FSID
 		c.BL = cached.BL
 		c.SessionSavedAt = cached.SavedAt
+		if cached.AccountTier != "" {
+			c.AccountTier = cached.AccountTier
+		} else {
+			c.AccountTier = DetectAccountTier("", c.cookiesFile)
+		}
 		c.IsInitialized = true
-		log.Printf("⚡ [Zero-Wait Instant Start] Loaded cached session for %s (0s bootstrap!)", cachePath)
+		log.Printf("⚡ [Zero-Wait Instant Start] Loaded cached session for %s (Tier: %s, 0s bootstrap!)", cachePath, c.AccountTier)
 		return true
 	}
 	return false
 }
 
 func (c *GeminiClient) persistSession() {
-	if c.SNlM0e == "" {
+	if c.SNlM0e == "" || c.cookiesFile == "" || c.cookiesFile == "guest" {
 		return
 	}
 	cachePath := c.getSessionCachePath()
@@ -270,15 +351,23 @@ func (c *GeminiClient) persistSession() {
 		BL:             c.BL,
 		SavedAt:        time.Now().Unix(),
 		RawCookiesHash: c.hashCookies(),
+		AccountTier:    c.AccountTier,
 	}
 	if data, err := json.MarshalIndent(saved, "", "  "); err == nil {
 		_ = os.MkdirAll(filepath.Dir(cachePath), 0755)
 		_ = os.WriteFile(cachePath, data, 0644)
-		log.Printf("💾 Persisted fresh session tokens to %s (valid for 18h)", cachePath)
+		log.Printf("💾 Persisted fresh session tokens to %s (valid for 18h, Tier: %s)", cachePath, c.AccountTier)
 	}
 }
 
 func (c *GeminiClient) InitSession() error {
+	if c.cookiesFile == "" || c.cookiesFile == "guest" {
+		c.AccountTier = "free"
+		c.IsInitialized = true
+		log.Println("🌐 [GeminiClient] Initialized in Guest / Anonymous Mode (no login required for Free tier models).")
+		return nil
+	}
+
 	// Step 1: Check instant session cache (0 roundtrips)
 	if c.loadCachedSession() {
 		return nil
@@ -286,21 +375,17 @@ func (c *GeminiClient) InitSession() error {
 
 	var lastErr error
 	for attempt := 1; attempt <= 2; attempt++ {
-		req, err := http.NewRequest("GET", "https://gemini.google.com/app", nil)
+		req, err := http.NewRequest("GET", fmt.Sprintf("https://gemini.google.com%s/app", c.getAccountPrefix()), nil)
 		if err != nil {
 			return err
 		}
-
-		// Apply exact Chrome JA4/JA4H HTTP/2 Headers & Pseudo-Headers
-		req.Header[http.HeaderOrderKey] = chromeHeaderOrder
-		req.Header[http.PHeaderOrderKey] = chromePseudoHeaderOrder
 
 		req.Header.Set("User-Agent", CurrentChromeUA)
 		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
 		req.Header.Set("sec-ch-ua", CurrentSecChUa)
 		req.Header.Set("sec-ch-ua-mobile", "?0")
 		req.Header.Set("sec-ch-ua-platform", CurrentPlatform)
-		req.Header.Set("Referer", "https://gemini.google.com/")
+		req.Header.Set("Referer", fmt.Sprintf("https://gemini.google.com%s/", c.getAccountPrefix()))
 
 		resp, err := c.client.Do(req)
 		if err != nil {
@@ -323,6 +408,12 @@ func (c *GeminiClient) InitSession() error {
 			continue
 		}
 		bodyStr := string(body)
+		log.Printf("InitSession attempt %d: status %d, body length %d, snippet: %s", attempt, resp.StatusCode, len(bodyStr), func() string {
+			if len(bodyStr) > 300 {
+				return bodyStr[:300]
+			}
+			return bodyStr
+		}())
 
 		snlm0eRe := regexp.MustCompile(`"SNlM0e":"(.*?)"`)
 		fsidRe := regexp.MustCompile(`"FdrFJe":"(.*?)"`)
@@ -338,6 +429,13 @@ func (c *GeminiClient) InitSession() error {
 				c.BL = cm[1]
 			}
 			c.IsInitialized = true
+			c.AccountTier = DetectAccountTier(bodyStr, c.cookiesFile)
+			if discovered := DiscoverModelsFromHTML(bodyStr); len(discovered) > 0 {
+				reg := GetModelRegistry()
+				for _, dm := range discovered {
+					reg.Register(dm)
+				}
+			}
 			c.persistSession()
 			return nil
 		}
@@ -388,17 +486,26 @@ func (c *GeminiClient) executeWithRetry(actionName string, runFunc func() error)
 }
 
 func (c *GeminiClient) Ask(prompt string) (*GeminiResponse, error) {
-	return c.AskWithTool(prompt, "")
+	return c.AskModel(prompt, "")
+}
+
+func (c *GeminiClient) AskModel(prompt string, modelName string) (*GeminiResponse, error) {
+	return c.AskWithToolModel(prompt, "", modelName)
 }
 
 // AskStream sends a prompt and streams text chunks via callback as they arrive
 func (c *GeminiClient) AskStream(prompt string, onChunk func(text string)) (*GeminiResponse, error) {
+	return c.AskStreamModel(prompt, "", onChunk)
+}
+
+// AskStreamModel streams with a specific target model
+func (c *GeminiClient) AskStreamModel(prompt string, modelName string, onChunk func(text string)) (*GeminiResponse, error) {
 	start := time.Now()
 	
 	var response *GeminiResponse
 	execErr := c.executeWithRetry("AskStream", func() error {
 		var err error
-		response, err = c.executeStreamRequest(prompt, onChunk)
+		response, err = c.executeStreamRequest(prompt, modelName, onChunk)
 		return err
 	})
 
@@ -411,18 +518,21 @@ func (c *GeminiClient) AskStream(prompt string, onChunk func(text string)) (*Gem
 }
 
 // executeStreamRequest performs the actual streaming call with HTTP/3 QUIC + HTTP/2 fallback
-func (c *GeminiClient) executeStreamRequest(prompt string, onChunk func(text string)) (*GeminiResponse, error) {
+func (c *GeminiClient) executeStreamRequest(prompt string, modelName string, onChunk func(text string)) (*GeminiResponse, error) {
 	if err := c.ensureInit(); err != nil {
 		return nil, err
 	}
 
-	// Build request (same payload as sendRequest)
+	modelCfg := GetModelRegistry().Resolve(modelName)
+
 	c.ReqID += 100
 	reqID := fmt.Sprintf("%d", c.ReqID)
 
-	msgInner := []interface{}{prompt, 0, nil, nil, nil, nil, 0}
+	convID, respID, choiceID := c.getConvState(modelCfg.ID)
+
+	msgInner := []interface{}{prompt, 0, nil, []interface{}{}, nil, nil, 0}
 	msgLang := []string{"en-GB"}
-	msgContext := []interface{}{c.ConversationID, c.ResponseID, c.ChoiceID, nil, nil, nil, nil, nil, nil, ""}
+	msgContext := []interface{}{convID, respID, choiceID, nil, nil, nil, nil, nil, nil, ""}
 	msgStruct := []interface{}{msgInner, msgLang, msgContext}
 
 	msgJSON, _ := json.Marshal(msgStruct)
@@ -431,9 +541,11 @@ func (c *GeminiClient) executeStreamRequest(prompt string, onChunk func(text str
 
 	data := url.Values{}
 	data.Set("f.req", string(fReqJSON))
-	data.Set("at", c.SNlM0e)
+	if c.SNlM0e != "" {
+		data.Set("at", c.SNlM0e)
+	}
 
-	urlStr := "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
+	urlStr := fmt.Sprintf("https://gemini.google.com%s/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate", c.getAccountPrefix())
 	query := url.Values{}
 	query.Add("bl", c.BL)
 	query.Add("_reqid", reqID)
@@ -447,14 +559,14 @@ func (c *GeminiClient) executeStreamRequest(prompt string, onChunk func(text str
 	var err error
 
 	if c.useQUIC {
-		rawBody, err = c.doStreamRequestQUIC(fullURL, data, onChunk)
+		rawBody, err = c.doStreamRequestQUIC(fullURL, data, modelCfg, onChunk)
 		if err != nil {
 			log.Printf("⚠️ HTTP/3 QUIC stream failed (%v). Falling back to HTTP/2 TLS...", err)
 			c.useQUIC = false
-			rawBody, err = c.doStreamRequestHTTP2(fullURL, data, onChunk)
+			rawBody, err = c.doStreamRequestHTTP2(fullURL, data, modelCfg, onChunk)
 		}
 	} else {
-		rawBody, err = c.doStreamRequestHTTP2(fullURL, data, onChunk)
+		rawBody, err = c.doStreamRequestHTTP2(fullURL, data, modelCfg, onChunk)
 	}
 
 	if err != nil {
@@ -465,9 +577,7 @@ func (c *GeminiClient) executeStreamRequest(prompt string, onChunk func(text str
 	parseResponse(rawBody, response)
 
 	if response.ConversationID != "" {
-		c.ConversationID = response.ConversationID
-		c.ResponseID = response.ResponseID
-		c.ChoiceID = response.ChoiceID
+		c.updateConvState(modelCfg.ID, response.ConversationID, response.ResponseID, response.ChoiceID)
 	}
 
 	// Video auto-detect
@@ -483,18 +593,24 @@ func (c *GeminiClient) executeStreamRequest(prompt string, onChunk func(text str
 	return response, nil
 }
 
-func (c *GeminiClient) doStreamRequestQUIC(fullURL string, data url.Values, onChunk func(text string)) (string, error) {
+func (c *GeminiClient) doStreamRequestQUIC(fullURL string, data url.Values, modelCfg *ModelConfig, onChunk func(text string)) (string, error) {
 	req, err := stdhttp.NewRequest("POST", fullURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return "", err
 	}
 
+	if modelCfg == nil {
+		modelCfg = GetModelRegistry().Resolve("")
+	}
+
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", CurrentChromeUA)
 	req.Header.Set("Origin", "https://gemini.google.com")
-	req.Header.Set("Referer", "https://gemini.google.com/")
+	req.Header.Set("Referer", fmt.Sprintf("https://gemini.google.com%s/app", c.getAccountPrefix()))
 	req.Header.Set("X-Same-Domain", "1")
-	req.Header.Set("x-goog-ext-525001261-jspb", flashHeaderValue)
+	jspbVal := modelCfg.BuildHeaderValue()
+	log.Printf("📡 [Request] model=%s jspb=%s", modelCfg.ID, jspbVal)
+	req.Header.Set("x-goog-ext-525001261-jspb", jspbVal)
 	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
 	req.Header.Set("x-goog-ext-73010989-jspb", `[0]`)
 	if c.RawCookies != "" {
@@ -514,10 +630,14 @@ func (c *GeminiClient) doStreamRequestQUIC(fullURL string, data url.Values, onCh
 	return c.readAndProcessStream(resp.Body, onChunk)
 }
 
-func (c *GeminiClient) doStreamRequestHTTP2(fullURL string, data url.Values, onChunk func(text string)) (string, error) {
+func (c *GeminiClient) doStreamRequestHTTP2(fullURL string, data url.Values, modelCfg *ModelConfig, onChunk func(text string)) (string, error) {
 	req, err := http.NewRequest("POST", fullURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return "", err
+	}
+
+	if modelCfg == nil {
+		modelCfg = GetModelRegistry().Resolve("")
 	}
 
 	req.Header[http.HeaderOrderKey] = chromeHeaderOrder
@@ -526,9 +646,11 @@ func (c *GeminiClient) doStreamRequestHTTP2(fullURL string, data url.Values, onC
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", CurrentChromeUA)
 	req.Header.Set("Origin", "https://gemini.google.com")
-	req.Header.Set("Referer", "https://gemini.google.com/")
+	req.Header.Set("Referer", fmt.Sprintf("https://gemini.google.com%s/app", c.getAccountPrefix()))
 	req.Header.Set("X-Same-Domain", "1")
-	req.Header.Set("x-goog-ext-525001261-jspb", flashHeaderValue)
+	jspbVal2 := modelCfg.BuildHeaderValue()
+	log.Printf("📡 [HTTP2-Request] model=%s jspb=%s", modelCfg.ID, jspbVal2)
+	req.Header.Set("x-goog-ext-525001261-jspb", jspbVal2)
 	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
 	req.Header.Set("x-goog-ext-73010989-jspb", `[0]`)
 
@@ -659,15 +781,21 @@ type ImageInput struct {
 }
 
 func (c *GeminiClient) AskWithImage(prompt string, imageBytes []byte, filename string, mimeType string) (*GeminiResponse, error) {
-	return c.AskWithImages(prompt, []ImageInput{{Data: imageBytes, Filename: filename, MimeType: mimeType}})
+	return c.AskWithImagesModel(prompt, []ImageInput{{Data: imageBytes, Filename: filename, MimeType: mimeType}}, "")
 }
 
 func (c *GeminiClient) AskWithImages(prompt string, images []ImageInput) (*GeminiResponse, error) {
+	return c.AskWithImagesModel(prompt, images, "")
+}
+
+func (c *GeminiClient) AskWithImagesModel(prompt string, images []ImageInput, modelName string) (*GeminiResponse, error) {
 	start := time.Now()
 
 	if err := c.ensureInit(); err != nil {
 		return nil, err
 	}
+
+	modelCfg := GetModelRegistry().Resolve(modelName)
 
 	// Upload all images and build imageRef array
 	var imageRef []interface{}
@@ -698,7 +826,7 @@ func (c *GeminiClient) AskWithImages(prompt string, images []ImageInput) (*Gemin
 	var response *GeminiResponse
 	var err error
 	execErr := c.executeWithRetry("AskWithImages", func() error {
-		_, response, err = c.sendRequest(prompt, "", imageRef)
+		_, response, err = c.sendRequest(prompt, "", imageRef, modelCfg)
 		if err != nil {
 			return err
 		}
@@ -713,9 +841,7 @@ func (c *GeminiClient) AskWithImages(prompt string, images []ImageInput) (*Gemin
 	}
 
 	if response.ConversationID != "" {
-		c.ConversationID = response.ConversationID
-		c.ResponseID = response.ResponseID
-		c.ChoiceID = response.ChoiceID
+		c.updateConvState(modelCfg.ID, response.ConversationID, response.ResponseID, response.ChoiceID)
 	}
 
 	// Auto-detect video generation and poll for video URL
@@ -804,15 +930,21 @@ func (c *GeminiClient) pollVideoURL(response *GeminiResponse) {
 }
 
 func (c *GeminiClient) AskWithTool(prompt string, tool string) (*GeminiResponse, error) {
+	return c.AskWithToolModel(prompt, tool, "")
+}
+
+func (c *GeminiClient) AskWithToolModel(prompt string, tool string, modelName string) (*GeminiResponse, error) {
 	start := time.Now()
 	if err := c.ensureInit(); err != nil {
 		return nil, err
 	}
 
+	modelCfg := GetModelRegistry().Resolve(modelName)
+
 	var response *GeminiResponse
 	var err error
 	execErr := c.executeWithRetry("AskWithTool", func() error {
-		_, response, err = c.sendRequest(prompt, tool, nil)
+		_, response, err = c.sendRequest(prompt, tool, nil, modelCfg)
 		if err != nil {
 			return err
 		}
@@ -827,9 +959,7 @@ func (c *GeminiClient) AskWithTool(prompt string, tool string) (*GeminiResponse,
 	}
 
 	if response.ConversationID != "" {
-		c.ConversationID = response.ConversationID
-		c.ResponseID = response.ResponseID
-		c.ChoiceID = response.ChoiceID
+		c.updateConvState(modelCfg.ID, response.ConversationID, response.ResponseID, response.ChoiceID)
 	}
 
 	// Music fallback: if URL didn't come in first response, quick poll
@@ -888,10 +1018,12 @@ func (c *GeminiClient) AskVideo(prompt string) (*GeminiResponse, error) {
 		prompt = "Generate a video of: " + prompt
 	}
 
+	modelCfg := GetModelRegistry().Resolve("")
+
 	var response *GeminiResponse
 	var err error
 	execErr := c.executeWithRetry("AskVideo", func() error {
-		_, response, err = c.sendRequest(prompt, "", nil)
+		_, response, err = c.sendRequest(prompt, "", nil, modelCfg)
 		if err != nil {
 			return err
 		}
@@ -906,9 +1038,7 @@ func (c *GeminiClient) AskVideo(prompt string) (*GeminiResponse, error) {
 	}
 
 	if response.ConversationID != "" {
-		c.ConversationID = response.ConversationID
-		c.ResponseID = response.ResponseID
-		c.ChoiceID = response.ChoiceID
+		c.updateConvState(modelCfg.ID, response.ConversationID, response.ResponseID, response.ChoiceID)
 	}
 
 	log.Printf("🎬 Video response: conv=%s, text=%s", response.ConversationID, response.Text[:min(len(response.Text), 100)])
@@ -940,9 +1070,11 @@ func (c *GeminiClient) CallRPC(rpcID, payload string) (string, error) {
 
 	body := url.Values{}
 	body.Set("f.req", string(wrapperJSON))
-	body.Set("at", c.SNlM0e)
+	if c.SNlM0e != "" {
+		body.Set("at", c.SNlM0e)
+	}
 
-	urlStr := "https://gemini.google.com/_/BardChatUi/data/batchexecute"
+	urlStr := fmt.Sprintf("https://gemini.google.com%s/_/BardChatUi/data/batchexecute", c.getAccountPrefix())
 
 	req, err := http.NewRequest("POST", urlStr, strings.NewReader(body.Encode()))
 	if err != nil {
@@ -966,7 +1098,7 @@ func (c *GeminiClient) CallRPC(rpcID, payload string) (string, error) {
 	req.Header.Set("sec-ch-ua-platform", CurrentPlatform)
 	req.Header.Set("User-Agent", CurrentChromeUA)
 	req.Header.Set("Origin", "https://gemini.google.com")
-	req.Header.Set("Referer", "https://gemini.google.com/")
+	req.Header.Set("Referer", fmt.Sprintf("https://gemini.google.com%s/app", c.getAccountPrefix()))
 	req.Header.Set("X-Same-Domain", "1")
 
 	resp, err := c.client.Do(req)
@@ -985,13 +1117,22 @@ func (c *GeminiClient) pollConversation(convID string) (string, error) {
 	return c.CallRPC("hNvQHb", payload)
 }
 
-func (c *GeminiClient) sendRequest(prompt string, tool string, imageRef []interface{}) (string, *GeminiResponse, error) {
+func (c *GeminiClient) sendRequest(prompt string, tool string, imageRef []interface{}, modelCfg *ModelConfig) (string, *GeminiResponse, error) {
+	if modelCfg == nil {
+		modelCfg = GetModelRegistry().Resolve("")
+	}
 	c.ReqID += 100
 	reqID := fmt.Sprintf("%d", c.ReqID)
 
-	msgInner := []interface{}{prompt, 0, nil, imageRef, nil, nil, 0}
+	convID, respID, choiceID := c.getConvState(modelCfg.ID)
+
+	imagesPayload := imageRef
+	if imagesPayload == nil {
+		imagesPayload = []interface{}{}
+	}
+	msgInner := []interface{}{prompt, 0, nil, imagesPayload, nil, nil, 0}
 	msgLang := []string{"en-GB"}
-	msgContext := []interface{}{c.ConversationID, c.ResponseID, c.ChoiceID, nil, nil, nil, nil, nil, nil, ""}
+	msgContext := []interface{}{convID, respID, choiceID, nil, nil, nil, nil, nil, nil, ""}
 	msgStruct := []interface{}{msgInner, msgLang, msgContext}
 
 	if tool != "" {
@@ -1007,9 +1148,11 @@ func (c *GeminiClient) sendRequest(prompt string, tool string, imageRef []interf
 
 	data := url.Values{}
 	data.Set("f.req", string(fReqJSON))
-	data.Set("at", c.SNlM0e)
+	if c.SNlM0e != "" {
+		data.Set("at", c.SNlM0e)
+	}
 
-	urlStr := "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
+	urlStr := fmt.Sprintf("https://gemini.google.com%s/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate", c.getAccountPrefix())
 	query := url.Values{}
 	query.Add("bl", c.BL)
 	query.Add("_reqid", reqID)
@@ -1023,14 +1166,14 @@ func (c *GeminiClient) sendRequest(prompt string, tool string, imageRef []interf
 	var err error
 
 	if c.useQUIC {
-		rawBody, err = c.sendRequestQUIC(fullURL, data)
+		rawBody, err = c.sendRequestQUIC(fullURL, data, modelCfg)
 		if err != nil {
 			log.Printf("⚠️ HTTP/3 QUIC request failed (%v). Falling back to HTTP/2 TLS...", err)
 			c.useQUIC = false
-			rawBody, err = c.sendRequestHTTP2(fullURL, data)
+			rawBody, err = c.sendRequestHTTP2(fullURL, data, modelCfg)
 		}
 	} else {
-		rawBody, err = c.sendRequestHTTP2(fullURL, data)
+		rawBody, err = c.sendRequestHTTP2(fullURL, data, modelCfg)
 	}
 
 	if err != nil {
@@ -1077,18 +1220,24 @@ func (c *GeminiClient) sendRequest(prompt string, tool string, imageRef []interf
 	return rawBody, response, nil
 }
 
-func (c *GeminiClient) sendRequestQUIC(fullURL string, data url.Values) (string, error) {
+func (c *GeminiClient) sendRequestQUIC(fullURL string, data url.Values, modelCfg *ModelConfig) (string, error) {
 	req, err := stdhttp.NewRequest("POST", fullURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return "", err
 	}
 
+	if modelCfg == nil {
+		modelCfg = GetModelRegistry().Resolve("")
+	}
+
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", CurrentChromeUA)
 	req.Header.Set("Origin", "https://gemini.google.com")
-	req.Header.Set("Referer", "https://gemini.google.com/")
+	req.Header.Set("Referer", fmt.Sprintf("https://gemini.google.com%s/app", c.getAccountPrefix()))
 	req.Header.Set("X-Same-Domain", "1")
-	req.Header.Set("x-goog-ext-525001261-jspb", flashHeaderValue)
+	jspbVal := modelCfg.BuildHeaderValue()
+	log.Printf("📡 [sendRequestQUIC] model=%s jspb=%s", modelCfg.ID, jspbVal)
+	req.Header.Set("x-goog-ext-525001261-jspb", jspbVal)
 	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
 	req.Header.Set("x-goog-ext-73010989-jspb", `[0]`)
 	if c.RawCookies != "" {
@@ -1112,10 +1261,14 @@ func (c *GeminiClient) sendRequestQUIC(fullURL string, data url.Values) (string,
 	return string(bodyBytes), nil
 }
 
-func (c *GeminiClient) sendRequestHTTP2(fullURL string, data url.Values) (string, error) {
+func (c *GeminiClient) sendRequestHTTP2(fullURL string, data url.Values, modelCfg *ModelConfig) (string, error) {
 	req, err := http.NewRequest("POST", fullURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return "", err
+	}
+
+	if modelCfg == nil {
+		modelCfg = GetModelRegistry().Resolve("")
 	}
 
 	req.Header[http.HeaderOrderKey] = chromeHeaderOrder
@@ -1124,9 +1277,11 @@ func (c *GeminiClient) sendRequestHTTP2(fullURL string, data url.Values) (string
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", CurrentChromeUA)
 	req.Header.Set("Origin", "https://gemini.google.com")
-	req.Header.Set("Referer", "https://gemini.google.com/")
+	req.Header.Set("Referer", fmt.Sprintf("https://gemini.google.com%s/app", c.getAccountPrefix()))
 	req.Header.Set("X-Same-Domain", "1")
-	req.Header.Set("x-goog-ext-525001261-jspb", flashHeaderValue)
+	jspbVal := modelCfg.BuildHeaderValue()
+	log.Printf("📡 [sendRequestHTTP2] model=%s jspb=%s", modelCfg.ID, jspbVal)
+	req.Header.Set("x-goog-ext-525001261-jspb", jspbVal)
 	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
 	req.Header.Set("x-goog-ext-73010989-jspb", `[0]`)
 
@@ -1137,6 +1292,8 @@ func (c *GeminiClient) sendRequestHTTP2(fullURL string, data url.Values) (string
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("❌ [sendRequestHTTP2] Failed with status %d: %s (Headers: %+v)", resp.StatusCode, string(bodyBytes[:min(len(bodyBytes), 300)]), resp.Header)
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 

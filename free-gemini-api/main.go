@@ -99,7 +99,7 @@ func main() {
 
 	// Initialize Fiber web application
 	app := fiber.New(fiber.Config{
-		AppName:   "Gemini Go API (HTTP/3 QUIC + Gemini 3.8 + Needle 2)",
+		AppName:   "Gemini Go API (HTTP/3 QUIC + Gemini Models + Arranger Engine)",
 		BodyLimit: 50 * 1024 * 1024, // 50MB
 	})
 

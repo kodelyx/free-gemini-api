@@ -63,10 +63,9 @@ func HandleJSONExport(c fiber.Ctx) error {
 // ExportAnalyticsToJSON compiles system stats, history, and financial ROI into structured JSON
 func ExportAnalyticsToJSON(outputPath string) (string, []byte, error) {
 	if outputPath == "" {
-		outputDir := "./output"
-		_ = os.MkdirAll(outputDir, 0755)
-		outputPath = filepath.Join(outputDir, "gemini_analytics.json")
+		outputPath = filepath.Join("./output", "gemini_analytics.json")
 	}
+	_ = os.MkdirAll(filepath.Dir(outputPath), 0755)
 
 	messages, _ := db.GetAllMessagesForExport()
 	media, _ := db.GetAllMediaForExport()
@@ -105,6 +104,8 @@ func ExportAnalyticsToJSON(outputPath string) (string, []byte, error) {
 			"media_breakdown":  mediaCounts,
 			"tracked_accounts": len(accounts),
 			"active_workers":   gemini.GetActiveWorkerCount(),
+			"tier_breakdown":   stats["tier_breakdown"],
+			"model_breakdown":  stats["model_breakdown"],
 		},
 		"financial_roi": fiber.Map{
 			"cost_saved_usd":           stats["cost_saved_usd"],
@@ -139,10 +140,9 @@ func ExportAnalyticsToJSON(outputPath string) (string, []byte, error) {
 // ExportAnalyticsToExcel creates a multi-sheet formatted Excel workbook
 func ExportAnalyticsToExcel(outputPath string) (string, error) {
 	if outputPath == "" {
-		outputDir := "./output"
-		_ = os.MkdirAll(outputDir, 0755)
-		outputPath = filepath.Join(outputDir, "gemini_analytics.xlsx")
+		outputPath = filepath.Join("./output", "gemini_analytics.xlsx")
 	}
+	_ = os.MkdirAll(filepath.Dir(outputPath), 0755)
 
 	messages, _ := db.GetAllMessagesForExport()
 	media, _ := db.GetAllMediaForExport()
@@ -155,7 +155,7 @@ func ExportAnalyticsToExcel(outputPath string) (string, error) {
 	// ─── Sheet 1: 📋 Chat History ───────────────────────────────────────────
 	sheetMessages := "📋 Chat History"
 	f.SetSheetName("Sheet1", sheetMessages)
-	msgHeaders := []string{"ID", "Conv ID", "User / IP", "Role", "Model", "Est. Tokens", "Created At", "Message Content"}
+	msgHeaders := []string{"ID", "Conv ID", "User / IP", "Role", "Model", "Account Tier", "Account ID", "Est. Tokens", "Created At", "Message Content"}
 	var msgRows [][]interface{}
 	totalTokens := 0
 	for _, m := range messages {
@@ -167,6 +167,8 @@ func ExportAnalyticsToExcel(outputPath string) (string, error) {
 			m["user_id"],
 			m["role"],
 			m["model"],
+			m["account_tier"],
+			m["account_id"],
 			tok,
 			m["created_at"],
 			m["content"],
@@ -430,6 +432,29 @@ func renderAnalyticsSummarySheet(f *excelize.File, sheetName string, totalMsgs, 
 	_ = f.SetCellStyle(sheetName, "B4", "B4", sectionStyle)
 
 	totalRequests, _ := stats["total_requests"].(int)
+	freeMsgs := 0
+	freeToks := 0
+	subMsgs := 0
+	subToks := 0
+	if tb, ok := stats["tier_breakdown"].(map[string]any); ok {
+		if fMap, ok := tb["free"].(map[string]any); ok {
+			if m, ok := fMap["messages"].(int); ok {
+				freeMsgs = m
+			}
+			if t, ok := fMap["tokens"].(int); ok {
+				freeToks = t
+			}
+		}
+		if sMap, ok := tb["subscription"].(map[string]any); ok {
+			if m, ok := sMap["messages"].(int); ok {
+				subMsgs = m
+			}
+			if t, ok := sMap["tokens"].(int); ok {
+				subToks = t
+			}
+		}
+	}
+
 	kpis := []struct {
 		Label     string
 		Val       string
@@ -437,6 +462,8 @@ func renderAnalyticsSummarySheet(f *excelize.File, sheetName string, totalMsgs, 
 	}{
 		{"Active Primary Model", "Google Gemini 3.8 Flash", false},
 		{"Total Chat Messages Logged", fmt.Sprintf("%d", totalMsgs), false},
+		{"Free Tier Usage (Messages / Tokens)", fmt.Sprintf("%d msgs / %d tokens", freeMsgs, freeToks), false},
+		{"Subscription Tier Usage (Pro / Adv)", fmt.Sprintf("%d msgs / %d tokens", subMsgs, subToks), false},
 		{"Total Media Items Generated", fmt.Sprintf("%d", totalMedia), false},
 		{"Total Tokens Processed (Est.)", fmt.Sprintf("%d", totalTokens), false},
 		{"Total HTTP Requests Logged", fmt.Sprintf("%d", totalRequests), false},
@@ -521,30 +548,34 @@ func renderAnalyticsSummarySheet(f *excelize.File, sheetName string, totalMsgs, 
 	// ─── Accounts Pool Table ────────────────────────────────────────────────
 	accStartRow := startRow + len(mediaRows) + 2
 	_ = f.SetCellValue(sheetName, fmt.Sprintf("A%d", accStartRow), "Account Profile ID")
-	_ = f.SetCellValue(sheetName, fmt.Sprintf("B%d", accStartRow), "Status")
-	_ = f.SetCellValue(sheetName, fmt.Sprintf("C%d", accStartRow), "Total Requests Handled")
-	_ = f.SetCellValue(sheetName, fmt.Sprintf("D%d", accStartRow), "Last Used At")
+	_ = f.SetCellValue(sheetName, fmt.Sprintf("B%d", accStartRow), "Account Tier")
+	_ = f.SetCellValue(sheetName, fmt.Sprintf("C%d", accStartRow), "Status")
+	_ = f.SetCellValue(sheetName, fmt.Sprintf("D%d", accStartRow), "Total Requests Handled")
+	_ = f.SetCellValue(sheetName, fmt.Sprintf("E%d", accStartRow), "Last Used At")
 	_ = f.SetCellStyle(sheetName, fmt.Sprintf("A%d", accStartRow), fmt.Sprintf("A%d", accStartRow), sectionStyle)
 	_ = f.SetCellStyle(sheetName, fmt.Sprintf("B%d", accStartRow), fmt.Sprintf("B%d", accStartRow), sectionStyle)
 	_ = f.SetCellStyle(sheetName, fmt.Sprintf("C%d", accStartRow), fmt.Sprintf("C%d", accStartRow), sectionStyle)
 	_ = f.SetCellStyle(sheetName, fmt.Sprintf("D%d", accStartRow), fmt.Sprintf("D%d", accStartRow), sectionStyle)
+	_ = f.SetCellStyle(sheetName, fmt.Sprintf("E%d", accStartRow), fmt.Sprintf("E%d", accStartRow), sectionStyle)
 
 	for i, acc := range accounts {
 		row := accStartRow + 1 + i
 		_ = f.SetCellValue(sheetName, fmt.Sprintf("A%d", row), acc["account_id"])
-		_ = f.SetCellValue(sheetName, fmt.Sprintf("B%d", row), acc["status"])
-		_ = f.SetCellValue(sheetName, fmt.Sprintf("C%d", row), acc["total_requests"])
-		_ = f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), acc["last_used_at"])
+		_ = f.SetCellValue(sheetName, fmt.Sprintf("B%d", row), acc["tier"])
+		_ = f.SetCellValue(sheetName, fmt.Sprintf("C%d", row), acc["status"])
+		_ = f.SetCellValue(sheetName, fmt.Sprintf("D%d", row), acc["total_requests"])
+		_ = f.SetCellValue(sheetName, fmt.Sprintf("E%d", row), acc["last_used_at"])
 		_ = f.SetCellStyle(sheetName, fmt.Sprintf("A%d", row), fmt.Sprintf("A%d", row), tableDataStyle)
 		_ = f.SetCellStyle(sheetName, fmt.Sprintf("B%d", row), fmt.Sprintf("B%d", row), tableDataStyle)
 		_ = f.SetCellStyle(sheetName, fmt.Sprintf("C%d", row), fmt.Sprintf("C%d", row), tableDataStyle)
 		_ = f.SetCellStyle(sheetName, fmt.Sprintf("D%d", row), fmt.Sprintf("D%d", row), tableDataStyle)
+		_ = f.SetCellStyle(sheetName, fmt.Sprintf("E%d", row), fmt.Sprintf("E%d", row), tableDataStyle)
 	}
 
 	_ = f.SetColWidth(sheetName, "A", "A", 36)
-	_ = f.SetColWidth(sheetName, "B", "B", 24)
-	_ = f.SetColWidth(sheetName, "C", "C", 24)
-	_ = f.SetColWidth(sheetName, "D", "D", 22)
+	_ = f.SetColWidth(sheetName, "B", "B", 18)
+	_ = f.SetColWidth(sheetName, "C", "C", 18)
+	_ = f.SetColWidth(sheetName, "D", "D", 24)
 	_ = f.SetColWidth(sheetName, "E", "E", 22)
 	_ = f.SetColWidth(sheetName, "F", "F", 18)
 	_ = f.SetColWidth(sheetName, "G", "G", 22)

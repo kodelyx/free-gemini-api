@@ -197,7 +197,9 @@ const ALLOWED_COOKIE_NAMES = new Set([
   'SAPISID',
   'SIDCC',
   'OSID',
-  '__Secure-OSID'
+  '__Secure-OSID',
+  'COMPASS',
+  'NID'
 ]);
 
 // Extracts and formats essential cookies directly from Chrome memory

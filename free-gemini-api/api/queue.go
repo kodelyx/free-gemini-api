@@ -19,6 +19,7 @@ type AccountWorker struct {
 	ID            string               `json:"id"`
 	CookiePath    string               `json:"cookie_path"`
 	Client        *gemini.GeminiClient `json:"-"`
+	Tier          string               `json:"tier"` // "free" or "subscription"
 	InFlight      int64                `json:"in_flight"`
 	TotalServed   int64                `json:"total_served"`
 	TotalErrors   int64                `json:"total_errors"`
@@ -99,6 +100,11 @@ func (p *WorkerPool) ReloadPool() {
 			// Existing worker — reload session
 			if existing.Client != nil {
 				_ = existing.Client.ReloadSession()
+				workerTier := existing.Client.AccountTier
+				if workerTier == "" || workerTier == "free" {
+					workerTier = "subscription"
+				}
+				existing.Tier = workerTier
 			}
 			updatedWorkers = append(updatedWorkers, existing)
 			continue
@@ -114,16 +120,49 @@ func (p *WorkerPool) ReloadPool() {
 			log.Printf("⚠️ [WorkerPool] Could not initialize client for %s: %v", cFile, err)
 			continue
 		}
+		_ = client.InitSession()
 
+		workerTier := client.AccountTier
+		if workerTier == "" || workerTier == "free" {
+			workerTier = "subscription"
+		}
 		worker := &AccountWorker{
 			ID:          accID,
 			CookiePath:  cFile,
 			Client:      client,
+			Tier:        workerTier,
 			Status:      "active",
 			LastUsed:    time.Now(),
 		}
 		updatedWorkers = append(updatedWorkers, worker)
-		log.Printf("🚀 [WorkerPool] Registered new Account Worker [%s] from %s", accID, cFile)
+		_ = db.RecordAccountUsage(accID, cFile, "active", client.AccountTier)
+		log.Printf("🚀 [WorkerPool] Registered new Account Worker [%s] (Tier: %s) from %s", accID, worker.Tier, cFile)
+	}
+
+	// Ensure a Guest Worker is available for zero-login free requests or as fallback
+	hasGuest := false
+	for _, w := range updatedWorkers {
+		if w.ID == "guest" {
+			hasGuest = true
+			break
+		}
+	}
+	if !hasGuest {
+		guestClient, err := gemini.NewClient("guest")
+		if err == nil {
+			_ = guestClient.InitSession()
+			guestWorker := &AccountWorker{
+				ID:         "guest",
+				CookiePath: "guest",
+				Client:     guestClient,
+				Tier:       "free",
+				Status:     "active",
+				LastUsed:   time.Now(),
+			}
+			updatedWorkers = append(updatedWorkers, guestWorker)
+			_ = db.RecordAccountUsage("guest", "guest", "active", "free")
+			log.Printf("🌐 [WorkerPool] Registered Guest Worker [guest] (Tier: free) — Ready out-of-the-box without login!")
+		}
 	}
 
 	p.workers = updatedWorkers
@@ -137,8 +176,13 @@ func (p *WorkerPool) BindAffinity(key, accountID string) {
 	}
 }
 
-// AcquireWorker selects the best available worker using Sticky Affinity or Least-Busy routing
+// AcquireWorker selects the best available worker (legacy wrapper defaulting to free/any tier)
 func (p *WorkerPool) AcquireWorker(ctx context.Context, affinityKey string) (*AccountWorker, error) {
+	return p.AcquireWorkerWithTier(ctx, affinityKey, "")
+}
+
+// AcquireWorkerWithTier selects the best available worker using Sticky Affinity, Tier Matching, or Least-Busy routing
+func (p *WorkerPool) AcquireWorkerWithTier(ctx context.Context, affinityKey string, requiredTier string) (*AccountWorker, error) {
 	timeout := 45 * time.Second
 	deadline := time.Now().Add(timeout)
 
@@ -163,41 +207,160 @@ func (p *WorkerPool) AcquireWorker(ctx context.Context, affinityKey string) (*Ac
 			continue
 		}
 
-		// 1. Check Sticky Affinity
+		// If subscription is strictly required, ensure at least one subscription or authenticated worker exists in pool
+		if requiredTier == "subscription" {
+			hasSubWorker := false
+			for _, w := range p.workers {
+				if w.Tier == "subscription" {
+					hasSubWorker = true
+					break
+				}
+			}
+			if !hasSubWorker {
+				for _, w := range p.workers {
+					if w.ID != "guest" && w.Tier != "free" {
+						hasSubWorker = true
+						break
+					}
+				}
+			}
+			if !hasSubWorker {
+				p.mu.RUnlock()
+				return nil, fmt.Errorf("requested model requires a subscription (Gemini Advanced) account, but no subscription accounts are connected in the pool")
+			}
+		}
+
+		// Check if ALL eligible workers are currently in cooldown / rate-limited
+		hasCandidate := false
+		allInCooldown := true
+		minCooldownRemaining := 24 * time.Hour
+
+		for _, w := range p.workers {
+			if requiredTier == "subscription" && w.Tier != "subscription" && w.ID == "guest" {
+				continue
+			}
+			hasCandidate = true
+			w.mu.Lock()
+			if w.CooldownUntil.IsZero() || time.Now().After(w.CooldownUntil) {
+				allInCooldown = false
+			} else {
+				rem := time.Until(w.CooldownUntil)
+				if rem < minCooldownRemaining {
+					minCooldownRemaining = rem
+				}
+			}
+			w.mu.Unlock()
+		}
+
+		if hasCandidate && allInCooldown {
+			p.mu.RUnlock()
+			if minCooldownRemaining <= 3*time.Second {
+				time.Sleep(minCooldownRemaining)
+				continue
+			}
+			secs := int(minCooldownRemaining.Seconds()) + 1
+			tierName := "free"
+			if requiredTier == "subscription" {
+				tierName = "subscription"
+			}
+			return nil, fmt.Errorf("rate_limit_exceeded: all %s tier Google accounts reached rate limit / quota. Cooldown active, next worker ready in %ds. Connect more accounts to increase quota", tierName, secs)
+		}
+
+		// 1. Check Sticky Affinity (if worker matches required tier)
 		if affinityKey != "" {
 			if targetID, ok := p.affinityMap.Load(affinityKey); ok {
 				for _, w := range p.workers {
 					if w.ID == targetID && w.IsHealthy() && atomic.LoadInt64(&w.InFlight) < p.maxConcurrencyPerWorker {
-						atomic.AddInt64(&w.InFlight, 1)
-						w.mu.Lock()
-						w.LastUsed = time.Now()
-						w.mu.Unlock()
-						p.mu.RUnlock()
-						return w, nil
+						// Ensure tier compatibility
+						if requiredTier != "subscription" || w.Tier == "subscription" || w.ID != "guest" {
+							atomic.AddInt64(&w.InFlight, 1)
+							w.mu.Lock()
+							w.LastUsed = time.Now()
+							w.mu.Unlock()
+							p.mu.RUnlock()
+							return w, nil
+						}
 					}
 				}
 			}
 		}
 
-		// 2. Least-Busy Load Balancing (Lowest In-Flight requests first)
+		// 2. Least-Busy Load Balancing
 		var bestWorker *AccountWorker
 		minInFlight := int64(999999)
-
-		// Round-robin offset for fair distribution among identical load workers
 		offset := atomic.AddUint64(&p.rrIndex, 1) % uint64(workersCount)
 
-		for i := 0; i < workersCount; i++ {
-			idx := (int(offset) + i) % workersCount
-			w := p.workers[idx]
-
-			if !w.IsHealthy() {
-				continue
+		if requiredTier == "subscription" {
+			// Subscription requests strictly require subscription workers if present in pool, else any authenticated worker
+			hasExplicitSub := false
+			for _, w := range p.workers {
+				if w.Tier == "subscription" && w.ID != "guest" {
+					hasExplicitSub = true
+					break
+				}
 			}
 
-			inFlight := atomic.LoadInt64(&w.InFlight)
-			if inFlight < p.maxConcurrencyPerWorker && inFlight < minInFlight {
-				minInFlight = inFlight
-				bestWorker = w
+			for i := 0; i < workersCount; i++ {
+				idx := (int(offset) + i) % workersCount
+				w := p.workers[idx]
+				if !w.IsHealthy() || w.ID == "guest" {
+					continue
+				}
+				if hasExplicitSub && w.Tier != "subscription" {
+					continue
+				}
+				inFlight := atomic.LoadInt64(&w.InFlight)
+				if inFlight < p.maxConcurrencyPerWorker && inFlight < minInFlight {
+					minInFlight = inFlight
+					bestWorker = w
+				}
+			}
+		} else {
+			// Free requests:
+			// Pass 1: Prefer free authenticated workers
+			for i := 0; i < workersCount; i++ {
+				idx := (int(offset) + i) % workersCount
+				w := p.workers[idx]
+				if !w.IsHealthy() || w.Tier != "free" || w.ID == "guest" {
+					continue
+				}
+				inFlight := atomic.LoadInt64(&w.InFlight)
+				if inFlight < p.maxConcurrencyPerWorker && inFlight < minInFlight {
+					minInFlight = inFlight
+					bestWorker = w
+				}
+			}
+
+			// Pass 2: If free authenticated workers busy or absent, allow healthy subscription workers
+			if bestWorker == nil {
+				for i := 0; i < workersCount; i++ {
+					idx := (int(offset) + i) % workersCount
+					w := p.workers[idx]
+					if !w.IsHealthy() || w.ID == "guest" {
+						continue
+					}
+					inFlight := atomic.LoadInt64(&w.InFlight)
+					if inFlight < p.maxConcurrencyPerWorker && inFlight < minInFlight {
+						minInFlight = inFlight
+						bestWorker = w
+					}
+				}
+			}
+
+			// Pass 3: Fall back to guest worker if no authenticated workers available or all on cooldown
+			if bestWorker == nil {
+				for i := 0; i < workersCount; i++ {
+					idx := (int(offset) + i) % workersCount
+					w := p.workers[idx]
+					if !w.IsHealthy() {
+						continue
+					}
+					inFlight := atomic.LoadInt64(&w.InFlight)
+					if inFlight < p.maxConcurrencyPerWorker && inFlight < minInFlight {
+						minInFlight = inFlight
+						bestWorker = w
+					}
+				}
 			}
 		}
 
@@ -234,7 +397,7 @@ func (p *WorkerPool) ReleaseWorker(worker *AccountWorker, err error) {
 	if err == nil {
 		atomic.AddInt64(&worker.TotalServed, 1)
 		worker.Status = "active"
-		_ = db.RecordAccountUsage(worker.ID, worker.CookiePath, "active")
+		_ = db.RecordAccountUsage(worker.ID, worker.CookiePath, "active", worker.Tier)
 		return
 	}
 
@@ -254,22 +417,29 @@ func (p *WorkerPool) ReleaseWorker(worker *AccountWorker, err error) {
 
 	if isRateLimit {
 		worker.Status = "cooldown"
-		worker.CooldownUntil = time.Now().Add(45 * time.Second)
-		log.Printf("⏳ [WorkerPool] Worker [%s] rate limited (429). In cooldown for 45s.", worker.ID)
-		_ = db.RecordAccountUsage(worker.ID, worker.CookiePath, "rate_limited")
+		worker.CooldownUntil = time.Now().Add(60 * time.Second)
+		log.Printf("⏳ [WorkerPool] Worker [%s] (Tier: %s) rate limited (429/quota). In cooldown for 60s.", worker.ID, worker.Tier)
+		_ = db.RecordAccountUsage(worker.ID, worker.CookiePath, "rate_limited", worker.Tier)
 	} else if isAuthOrExpiry {
 		worker.Status = "recovering"
 		worker.CooldownUntil = time.Now().Add(15 * time.Second)
 		log.Printf("🚨 [WorkerPool] Worker [%s] auth/session issue detected. Triggering cookie sync...", worker.ID)
 		gemini.BroadcastCookieRefresh()
-		_ = db.RecordAccountUsage(worker.ID, worker.CookiePath, "error")
+		_ = db.RecordAccountUsage(worker.ID, worker.CookiePath, "error", worker.Tier)
 	} else {
-		_ = db.RecordAccountUsage(worker.ID, worker.CookiePath, "error")
+		_ = db.RecordAccountUsage(worker.ID, worker.CookiePath, "error", worker.Tier)
 	}
 }
 
 // ExecuteQueued dispatches a request through the worker pool with automatic retry on alternative workers
 func (p *WorkerPool) ExecuteQueued(ctx context.Context, affinityKey string, op func(*gemini.GeminiClient) (*gemini.GeminiResponse, error)) (*gemini.GeminiResponse, error) {
+	return p.ExecuteQueuedWithTier(ctx, affinityKey, "", func(w *AccountWorker) (*gemini.GeminiResponse, error) {
+		return op(w.Client)
+	})
+}
+
+// ExecuteQueuedWithTier handles request execution with specific tier requirement
+func (p *WorkerPool) ExecuteQueuedWithTier(ctx context.Context, affinityKey string, requiredTier string, op func(w *AccountWorker) (*gemini.GeminiResponse, error)) (*gemini.GeminiResponse, error) {
 	maxAttempts := 3
 	p.mu.RLock()
 	availableCount := len(p.workers)
@@ -282,12 +452,12 @@ func (p *WorkerPool) ExecuteQueued(ctx context.Context, affinityKey string, op f
 	var lastErr error
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		worker, err := p.AcquireWorker(ctx, affinityKey)
+		worker, err := p.AcquireWorkerWithTier(ctx, affinityKey, requiredTier)
 		if err != nil {
 			return nil, fmt.Errorf("failed to acquire worker from pool: %w", err)
 		}
 
-		resp, opErr := op(worker.Client)
+		resp, opErr := op(worker)
 		p.ReleaseWorker(worker, opErr)
 
 		if opErr == nil {
@@ -301,7 +471,7 @@ func (p *WorkerPool) ExecuteQueued(ctx context.Context, affinityKey string, op f
 		}
 
 		lastErr = opErr
-		log.Printf("⚠️ [WorkerPool] Worker [%s] attempt %d/%d failed: %v. Retrying on another worker...", worker.ID, attempt, maxAttempts, opErr)
+		log.Printf("⚠️ [WorkerPool] Worker [%s] (Tier: %s) attempt %d/%d failed: %v. Retrying on another worker...", worker.ID, worker.Tier, attempt, maxAttempts, opErr)
 
 		// On failure, remove affinity to avoid sticking to a broken worker
 		if affinityKey != "" {
@@ -316,15 +486,24 @@ func (p *WorkerPool) ExecuteQueued(ctx context.Context, affinityKey string, op f
 
 // ExecuteQueuedStream handles streaming completions through the worker queue with guaranteed release
 func (p *WorkerPool) ExecuteQueuedStream(ctx context.Context, affinityKey string, op func(*gemini.GeminiClient) error) error {
-	worker, err := p.AcquireWorker(ctx, affinityKey)
+	return p.ExecuteQueuedStreamWithTier(ctx, affinityKey, "", func(w *AccountWorker) error {
+		return op(w.Client)
+	})
+}
+
+// ExecuteQueuedStreamWithTier handles streaming completions requiring a specific account tier
+func (p *WorkerPool) ExecuteQueuedStreamWithTier(ctx context.Context, affinityKey string, requiredTier string, op func(w *AccountWorker) error) error {
+	worker, err := p.AcquireWorkerWithTier(ctx, affinityKey, requiredTier)
 	if err != nil {
 		return fmt.Errorf("failed to acquire worker for streaming: %w", err)
 	}
-	defer p.ReleaseWorker(worker, nil)
-
-	streamErr := op(worker.Client)
-	if streamErr != nil {
+	var streamErr error
+	defer func() {
 		p.ReleaseWorker(worker, streamErr)
+	}()
+
+	streamErr = op(worker)
+	if streamErr != nil {
 		return streamErr
 	}
 
@@ -339,22 +518,25 @@ func (p *WorkerPool) ExecuteQueuedStream(ctx context.Context, affinityKey string
 
 // WorkerPoolStats represents the live metrics of the worker pool
 type WorkerPoolStats struct {
-	TotalWorkers   int                      `json:"total_workers"`
-	ActiveWorkers  int                      `json:"active_workers"`
-	TotalInFlight  int64                    `json:"total_in_flight"`
-	MaxConcurrency int64                    `json:"max_concurrency_per_worker"`
-	Workers        []WorkerStats            `json:"workers"`
+	TotalWorkers        int           `json:"total_workers"`
+	ActiveWorkers       int           `json:"active_workers"`
+	FreeWorkers         int           `json:"free_workers"`
+	SubscriptionWorkers int           `json:"subscription_workers"`
+	TotalInFlight       int64         `json:"total_in_flight"`
+	MaxConcurrency      int64         `json:"max_concurrency_per_worker"`
+	Workers             []WorkerStats `json:"workers"`
 }
 
 type WorkerStats struct {
-	ID                     string `json:"id"`
-	CookiePath             string `json:"cookie_path"`
-	Status                 string `json:"status"`
-	InFlight               int64  `json:"in_flight"`
-	TotalServed            int64  `json:"total_served"`
-	TotalErrors            int64  `json:"total_errors"`
-	CooldownSecsRemaining  int    `json:"cooldown_seconds_remaining"`
-	LastUsed               string `json:"last_used"`
+	ID                    string `json:"id"`
+	CookiePath            string `json:"cookie_path"`
+	Status                string `json:"status"`
+	Tier                  string `json:"tier"`
+	InFlight              int64  `json:"in_flight"`
+	TotalServed           int64  `json:"total_served"`
+	TotalErrors           int64  `json:"total_errors"`
+	CooldownSecsRemaining int    `json:"cooldown_seconds_remaining"`
+	LastUsed              string `json:"last_used"`
 }
 
 // GetStats returns real-time snapshot of the worker pool
@@ -382,10 +564,17 @@ func (p *WorkerPool) GetStats() WorkerPoolStats {
 			stats.ActiveWorkers++
 		}
 
+		if w.Tier == "subscription" {
+			stats.SubscriptionWorkers++
+		} else {
+			stats.FreeWorkers++
+		}
+
 		ws := WorkerStats{
 			ID:                    w.ID,
 			CookiePath:            w.CookiePath,
 			Status:                w.Status,
+			Tier:                  w.Tier,
 			InFlight:              inFlight,
 			TotalServed:           atomic.LoadInt64(&w.TotalServed),
 			TotalErrors:           atomic.LoadInt64(&w.TotalErrors),
@@ -397,4 +586,46 @@ func (p *WorkerPool) GetStats() WorkerPoolStats {
 	}
 
 	return stats
+}
+
+// DiscoverModelsFromWorkers triggers autonomous model and tier discovery on all connected accounts
+func (p *WorkerPool) DiscoverModelsFromWorkers() (map[string]any, error) {
+	p.mu.RLock()
+	workersList := make([]*AccountWorker, len(p.workers))
+	copy(workersList, p.workers)
+	p.mu.RUnlock()
+
+	discoveredCount := 0
+	workerResults := make([]map[string]any, 0)
+
+	for _, w := range workersList {
+		if w.Client == nil {
+			continue
+		}
+		newModels, err := gemini.DiscoverAccountModels(w.Client)
+		if err == nil {
+			discoveredCount += len(newModels)
+			w.mu.Lock()
+			w.Tier = w.Client.AccountTier
+			w.mu.Unlock()
+			_ = db.RecordAccountUsage(w.ID, w.CookiePath, w.Status, w.Client.AccountTier)
+		}
+
+		res := map[string]any{
+			"worker_id":         w.ID,
+			"tier":              w.Tier,
+			"discovered_models": len(newModels),
+		}
+		if err != nil {
+			res["error"] = err.Error()
+		}
+		workerResults = append(workerResults, res)
+	}
+
+	return map[string]any{
+		"workers_checked":  len(workersList),
+		"models_found":    discoveredCount,
+		"workers":          workerResults,
+		"active_registry": gemini.GetModelRegistry().GetAll(),
+	}, nil
 }

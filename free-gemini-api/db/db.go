@@ -52,11 +52,15 @@ func InitDB() (*sql.DB, error) {
 			content TEXT NOT NULL,
 			model TEXT,
 			tokens INTEGER DEFAULT 0,
+			account_tier TEXT DEFAULT 'free',
+			account_id TEXT DEFAULT '',
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 
 		CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
 		CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
+		CREATE INDEX IF NOT EXISTS idx_messages_tier ON messages(account_tier);
+		CREATE INDEX IF NOT EXISTS idx_messages_model ON messages(model);
 
 		CREATE TABLE IF NOT EXISTS media_generations (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,6 +91,7 @@ func InitDB() (*sql.DB, error) {
 			account_id TEXT UNIQUE NOT NULL,
 			cookie_file TEXT NOT NULL,
 			status TEXT DEFAULT 'active',
+			tier TEXT DEFAULT 'free',
 			total_requests INTEGER DEFAULT 0,
 			last_used_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
@@ -97,6 +102,11 @@ func InitDB() (*sql.DB, error) {
 			return
 		}
 
+		// Auto-migrate existing database tables
+		_, _ = database.Exec(`ALTER TABLE messages ADD COLUMN account_tier TEXT DEFAULT 'free'`)
+		_, _ = database.Exec(`ALTER TABLE messages ADD COLUMN account_id TEXT DEFAULT ''`)
+		_, _ = database.Exec(`ALTER TABLE accounts ADD COLUMN tier TEXT DEFAULT 'free'`)
+
 		DB = database
 		log.Println("🗄️  SQLite Database initialized successfully at data/gemini.db (WAL Mode)")
 	})
@@ -104,15 +114,23 @@ func InitDB() (*sql.DB, error) {
 	return DB, initErr
 }
 
-// LogMessage saves a chat turn into SQLite
+// LogMessage saves a chat turn into SQLite (legacy fallback)
 func LogMessage(conversationID, userID, role, content, model string, tokens int) error {
+	return LogMessageWithTier(conversationID, userID, role, content, model, tokens, "free", "")
+}
+
+// LogMessageWithTier saves a chat turn into SQLite with account tier and worker ID
+func LogMessageWithTier(conversationID, userID, role, content, model string, tokens int, accountTier, accountID string) error {
 	if DB == nil {
 		return nil
 	}
 	dbMu.Lock()
 	defer dbMu.Unlock()
-	query := `INSERT INTO messages (conversation_id, user_id, role, content, model, tokens) VALUES (?, ?, ?, ?, ?, ?)`
-	_, err := DB.Exec(query, conversationID, userID, role, content, model, tokens)
+	if accountTier == "" {
+		accountTier = "free"
+	}
+	query := `INSERT INTO messages (conversation_id, user_id, role, content, model, tokens, account_tier, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	_, err := DB.Exec(query, conversationID, userID, role, content, model, tokens, accountTier, accountID)
 	return err
 }
 
@@ -243,7 +261,7 @@ func GetMediaByPrompt(mediaType, query string, limit int) ([]map[string]any, err
 	return result, nil
 }
 
-// GetSystemStats returns aggregate statistics and official API cost savings from SQLite
+// GetSystemStats returns aggregate statistics, official API cost savings, and separate Free vs Subscription metrics
 func GetSystemStats() (map[string]any, error) {
 	if DB == nil {
 		return map[string]any{"status": "database_not_connected"}, nil
@@ -259,62 +277,105 @@ func GetSystemStats() (map[string]any, error) {
 	_ = DB.QueryRow(`SELECT COUNT(*) FROM media_generations WHERE type='music'`).Scan(&totalMusic)
 	_ = DB.QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&totalRequests)
 
-	// Official Google Cloud / Vertex AI & Gemini API pricing:
-	// - Gemini Flash Text: $0.50 / 1M tokens ($0.0000005 per token)
-	// - Imagen 3: $0.030 per image
-	// - Video Generation: $1.20 per video
-	// - Music Generation: $0.08 per audio track
-	costSavedUSD := (float64(totalTokens) * 0.0000005) +
-		(float64(totalImages) * 0.030) +
-		(float64(totalVideos) * 1.200) +
-		(float64(totalMusic) * 0.080)
+	// Free Tier vs Subscription Tier Breakdown
+	var freeMessages, subMessages int
+	var freeTokens, subTokens int
+	_ = DB.QueryRow(`SELECT COUNT(*) FROM messages WHERE account_tier = 'free' OR account_tier IS NULL OR account_tier = ''`).Scan(&freeMessages)
+	_ = DB.QueryRow(`SELECT COALESCE(SUM(tokens), 0) FROM messages WHERE account_tier = 'free' OR account_tier IS NULL OR account_tier = ''`).Scan(&freeTokens)
+	_ = DB.QueryRow(`SELECT COUNT(*) FROM messages WHERE account_tier = 'subscription'`).Scan(&subMessages)
+	_ = DB.QueryRow(`SELECT COALESCE(SUM(tokens), 0) FROM messages WHERE account_tier = 'subscription'`).Scan(&subTokens)
+
+	// Models breakdown by model and tier
+	modelStats := make(map[string]map[string]int)
+	mRows, err := DB.Query(`SELECT COALESCE(model, 'unknown'), COALESCE(account_tier, 'free'), COUNT(*), COALESCE(SUM(tokens), 0) FROM messages GROUP BY model, account_tier`)
+	if err == nil {
+		defer mRows.Close()
+		for mRows.Next() {
+			var mName, mTier string
+			var mCount, mTok int
+			if err := mRows.Scan(&mName, &mTier, &mCount, &mTok); err == nil {
+				key := fmt.Sprintf("%s (%s)", mName, mTier)
+				modelStats[key] = map[string]int{
+					"messages": mCount,
+					"tokens":   mTok,
+				}
+			}
+		}
+	}
+
+	// Cost savings:
+	// Free Tier Flash tokens: $0.50 / 1M tokens ($0.0000005/token)
+	// Subscription Tier Pro tokens: $2.50 / 1M tokens ($0.0000025/token)
+	freeCostTokensUSD := float64(freeTokens) * 0.0000005
+	subCostTokensUSD := float64(subTokens) * 0.0000025
+	mediaCostUSD := (float64(totalImages) * 0.030) + (float64(totalVideos) * 1.200) + (float64(totalMusic) * 0.080)
+
+	costSavedUSD := freeCostTokensUSD + subCostTokensUSD + mediaCostUSD
 	usdToINR := GetUSDToINRRate()
 	costSavedINR := costSavedUSD * usdToINR
 
 	return map[string]any{
-		"total_messages":          totalMessages,
-		"total_tokens":            totalTokens,
-		"total_media":             totalMedia,
-		"total_images":            totalImages,
-		"total_videos":            totalVideos,
-		"total_music":             totalMusic,
-		"total_requests":          totalRequests,
-		"cost_saved_usd":          costSavedUSD,
-		"cost_saved_inr":          costSavedINR,
+		"total_messages": totalMessages,
+		"total_tokens":   totalTokens,
+		"tier_breakdown": map[string]any{
+			"free": map[string]any{
+				"messages":       freeMessages,
+				"tokens":         freeTokens,
+				"cost_saved_usd": fmt.Sprintf("$%.4f", freeCostTokensUSD),
+			},
+			"subscription": map[string]any{
+				"messages":       subMessages,
+				"tokens":         subTokens,
+				"cost_saved_usd": fmt.Sprintf("$%.4f", subCostTokensUSD),
+			},
+		},
+		"model_breakdown":          modelStats,
+		"total_media":              totalMedia,
+		"total_images":             totalImages,
+		"total_videos":             totalVideos,
+		"total_music":              totalMusic,
+		"total_requests":           totalRequests,
+		"cost_saved_usd":           costSavedUSD,
+		"cost_saved_inr":           costSavedINR,
 		"cost_saved_usd_formatted": fmt.Sprintf("$%.4f", costSavedUSD),
 		"cost_saved_inr_formatted": fmt.Sprintf("₹%.2f", costSavedINR),
-		"engine":                  "SQLite WAL Mode",
-		"database_file":           DBFileName,
+		"engine":                   "SQLite WAL Mode",
+		"database_file":            DBFileName,
 	}, nil
 }
 
-// RecordAccountUsage inserts or updates account status and usage metrics in SQLite
-func RecordAccountUsage(accountID, cookieFile, status string) error {
+// RecordAccountUsage inserts or updates account status, tier and usage metrics in SQLite
+func RecordAccountUsage(accountID, cookieFile, status, tier string) error {
 	if DB == nil {
 		return nil
 	}
 	dbMu.Lock()
 	defer dbMu.Unlock()
 
+	if tier == "" {
+		tier = "free"
+	}
+
 	query := `
-	INSERT INTO accounts (account_id, cookie_file, status, total_requests, last_used_at)
-	VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+	INSERT INTO accounts (account_id, cookie_file, status, tier, total_requests, last_used_at)
+	VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
 	ON CONFLICT(account_id) DO UPDATE SET
 		cookie_file = excluded.cookie_file,
 		status = excluded.status,
+		tier = excluded.tier,
 		total_requests = accounts.total_requests + 1,
 		last_used_at = CURRENT_TIMESTAMP;
 	`
-	_, err := DB.Exec(query, accountID, cookieFile, status)
+	_, err := DB.Exec(query, accountID, cookieFile, status, tier)
 	return err
 }
 
-// GetAccounts retrieves all tracked accounts and their usage statistics
+// GetAccounts retrieves all tracked accounts, tiers, and their usage statistics
 func GetAccounts() ([]map[string]any, error) {
 	if DB == nil {
 		return nil, nil
 	}
-	rows, err := DB.Query(`SELECT account_id, cookie_file, status, total_requests, last_used_at FROM accounts ORDER BY last_used_at DESC`)
+	rows, err := DB.Query(`SELECT account_id, cookie_file, status, COALESCE(tier, 'free'), total_requests, last_used_at FROM accounts ORDER BY last_used_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -322,13 +383,14 @@ func GetAccounts() ([]map[string]any, error) {
 
 	var accounts []map[string]any
 	for rows.Next() {
-		var accountID, cookieFile, status, lastUsed string
+		var accountID, cookieFile, status, tier, lastUsed string
 		var totalRequests int
-		if err := rows.Scan(&accountID, &cookieFile, &status, &totalRequests, &lastUsed); err == nil {
+		if err := rows.Scan(&accountID, &cookieFile, &status, &tier, &totalRequests, &lastUsed); err == nil {
 			accounts = append(accounts, map[string]any{
 				"account_id":     accountID,
 				"cookie_file":    cookieFile,
 				"status":         status,
+				"tier":           tier,
 				"total_requests": totalRequests,
 				"last_used_at":   lastUsed,
 			})
@@ -342,7 +404,7 @@ func GetAllMessagesForExport() ([]map[string]any, error) {
 	if DB == nil {
 		return nil, nil
 	}
-	query := `SELECT id, conversation_id, user_id, role, content, model, tokens, created_at FROM messages ORDER BY id ASC LIMIT 5000`
+	query := `SELECT id, conversation_id, user_id, role, content, model, tokens, COALESCE(account_tier, 'free'), COALESCE(account_id, ''), created_at FROM messages ORDER BY id ASC LIMIT 5000`
 	rows, err := DB.Query(query)
 	if err != nil {
 		return nil, err
@@ -352,8 +414,8 @@ func GetAllMessagesForExport() ([]map[string]any, error) {
 	var list []map[string]any
 	for rows.Next() {
 		var id, tokens int
-		var convID, userID, role, content, model, createdAt string
-		if err := rows.Scan(&id, &convID, &userID, &role, &content, &model, &tokens, &createdAt); err == nil {
+		var convID, userID, role, content, model, tier, accID, createdAt string
+		if err := rows.Scan(&id, &convID, &userID, &role, &content, &model, &tokens, &tier, &accID, &createdAt); err == nil {
 			list = append(list, map[string]any{
 				"id":              id,
 				"conversation_id": convID,
@@ -362,6 +424,8 @@ func GetAllMessagesForExport() ([]map[string]any, error) {
 				"content":         content,
 				"model":           model,
 				"tokens":          tokens,
+				"account_tier":    tier,
+				"account_id":      accID,
 				"created_at":      createdAt,
 			})
 		}

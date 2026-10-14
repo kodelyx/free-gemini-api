@@ -1,5 +1,5 @@
 -- ============================================================================
--- Free Gemini API (pure Go + HTTP/3 QUIC + Gemini 3.8 + Needle 2)
+-- Free Gemini API (pure Go + HTTP/3 QUIC + Gemini Models + Arranger Engine)
 -- High-Performance SQLite Database Schema (data/gemini.db)
 -- ============================================================================
 

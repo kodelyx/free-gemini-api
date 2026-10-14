@@ -18,24 +18,7 @@ import (
 	"github.com/google/uuid"
 )
 
-func FormatOpenAIToolsForNeedle(tools []map[string]any) string {
-	var needleTools []map[string]any
-	for _, t := range tools {
-		if t["type"] == "function" && t["function"] != nil {
-			if fn, ok := t["function"].(map[string]any); ok {
-				needleTools = append(needleTools, map[string]any{
-					"name":        fn["name"],
-					"description": fn["description"],
-					"parameters":  fn["parameters"],
-				})
-			}
-		} else {
-			needleTools = append(needleTools, t)
-		}
-	}
-	bytes, _ := json.Marshal(needleTools)
-	return string(bytes)
-}
+
 
 // EstimateTokens calculates an accurate token count using word and character heuristics
 func EstimateTokens(text string) int {
@@ -63,7 +46,7 @@ func EstimateTokens(text string) int {
 
 // HandleUnifiedChat handles /chat endpoint (text, images, screen recordings, ref videos)
 func HandleUnifiedChat(c fiber.Ctx) error {
-	var prompt, userID string
+	var prompt, userID, reqModel string
 	var newChat, stream bool
 	var images []gemini.ImageInput
 
@@ -74,6 +57,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 		userID = c.FormValue("user_id")
 		newChat = c.FormValue("new_chat") == "true"
 		stream = c.FormValue("stream") == "true"
+		reqModel = c.FormValue("model")
 
 		form, err := c.MultipartForm()
 		if err != nil {
@@ -129,6 +113,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 		userID = req.UserID
 		newChat = req.NewChat
 		stream = req.Stream
+		reqModel = req.Model
 	}
 
 	sessionID := userID
@@ -140,15 +125,13 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 		UserSessions.Delete(sessionID)
 	}
 
-	client, err := GetOrCreateClient(sessionID)
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-	}
+	modelCfg := gemini.GetModelRegistry().Resolve(reqModel)
+	model := modelCfg.ID
+	requiredTier := modelCfg.MinTier
+	pool := GetWorkerPool()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-
-	var resp *gemini.GeminiResponse
 
 	if stream && len(images) == 0 {
 		c.Set("Content-Type", "text/event-stream")
@@ -157,10 +140,19 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 		c.Set("X-Accel-Buffering", "no")
 
 		return c.SendStreamWriter(func(w *bufio.Writer) {
-			streamResp, streamErr := client.AskStream(prompt, func(chunk string) {
-				data, _ := json.Marshal(fiber.Map{"text": chunk})
-				fmt.Fprintf(w, "data: %s\n\n", data)
-				w.Flush()
+			var usedWorker *AccountWorker
+			var streamResp *gemini.GeminiResponse
+			startTime := time.Now()
+
+			streamErr := pool.ExecuteQueuedStreamWithTier(ctx, sessionID, requiredTier, func(worker *AccountWorker) error {
+				usedWorker = worker
+				sr, err := worker.Client.AskStreamModel(prompt, model, func(chunk string) {
+					data, _ := json.Marshal(fiber.Map{"text": chunk})
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					w.Flush()
+				})
+				streamResp = sr
+				return err
 			})
 
 			if streamErr != nil {
@@ -170,27 +162,29 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 				return
 			}
 
-			if len(streamResp.Images) > 0 {
-				for i, imgURL := range streamResp.Images {
-					filename := fmt.Sprintf("img_%s_%d.png", streamResp.ResponseID, i)
-					if streamResp.ResponseID == "" {
-						filename = fmt.Sprintf("img_%d_%d.png", time.Now().Unix(), i)
-					}
-					if err := DownloadAndClean(client, imgURL, filename, "image"); err == nil {
-						streamResp.Images[i] = fmt.Sprintf("http://%s/output/%s", c.Host(), filename)
+			if streamResp != nil && usedWorker != nil {
+				if len(streamResp.Images) > 0 {
+					for i, imgURL := range streamResp.Images {
+						filename := fmt.Sprintf("img_%s_%d.png", streamResp.ResponseID, i)
+						if streamResp.ResponseID == "" {
+							filename = fmt.Sprintf("img_%d_%d.png", time.Now().Unix(), i)
+						}
+						if err := DownloadAndClean(usedWorker.Client, imgURL, filename, "image"); err == nil {
+							streamResp.Images[i] = fmt.Sprintf("http://%s/output/%s", c.Host(), filename)
+						}
 					}
 				}
-			}
 
-			if len(streamResp.Videos) > 0 {
-				vidURL := streamResp.Videos[0]
-				if vidURL != "" && len(vidURL) > 50 {
-					filename := fmt.Sprintf("vid_%s_0.mp4", streamResp.ResponseID)
-					if streamResp.ResponseID == "" {
-						filename = fmt.Sprintf("vid_%d_0.mp4", time.Now().Unix())
-					}
-					if err := DownloadAndClean(client, vidURL, filename, "video"); err == nil {
-						streamResp.Videos[0] = fmt.Sprintf("http://%s/output/%s", c.Host(), filename)
+				if len(streamResp.Videos) > 0 {
+					vidURL := streamResp.Videos[0]
+					if vidURL != "" && len(vidURL) > 50 {
+						filename := fmt.Sprintf("vid_%s_0.mp4", streamResp.ResponseID)
+						if streamResp.ResponseID == "" {
+							filename = fmt.Sprintf("vid_%d_0.mp4", time.Now().Unix())
+						}
+						if err := DownloadAndClean(usedWorker.Client, vidURL, filename, "video"); err == nil {
+							streamResp.Videos[0] = fmt.Sprintf("http://%s/output/%s", c.Host(), filename)
+						}
 					}
 				}
 			}
@@ -201,28 +195,42 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 			w.Flush()
 
 			userIP := c.IP()
+			elapsed := time.Since(startTime).Seconds()
 			go func() {
-				pTokens := CountTokens(prompt)
-				rTokens := CountTokens(streamResp.Text)
-				db.LogMessage(streamResp.ConversationID, sessionID, "user", prompt, "gemini-3.8-flash", pTokens)
-				if streamResp.Text != "" {
-					db.LogMessage(streamResp.ConversationID, sessionID, "assistant", streamResp.Text, "gemini-3.8-flash", rTokens)
+				tier := "free"
+				accID := ""
+				if usedWorker != nil {
+					tier = usedWorker.Tier
+					accID = usedWorker.ID
 				}
-				db.LogRequest("/chat", "POST", userIP, 200, streamResp.Elapsed*1000)
+				pTokens := CountTokens(prompt)
+				rTokens := 0
+				convID := ""
+				if streamResp != nil {
+					rTokens = CountTokens(streamResp.Text)
+					convID = streamResp.ConversationID
+				}
+				db.LogMessageWithTier(convID, sessionID, "user", prompt, model, pTokens, tier, accID)
+				if streamResp != nil && streamResp.Text != "" {
+					db.LogMessageWithTier(convID, sessionID, "assistant", streamResp.Text, model, rTokens, tier, accID)
+				}
+				db.LogRequest("/chat", "POST", userIP, 200, elapsed*1000)
 				AutoExportAnalytics()
 			}()
 		})
 	}
 
 	if len(images) > 0 {
-		log.Printf("📸 Image/Media request: %d items, prompt: %s", len(images), prompt)
+		log.Printf("📸 Image/Media request: %d items, prompt: %s (model: %s, tier: %s)", len(images), prompt, model, requiredTier)
 	}
 
-	resp, err = ExecuteWithFailover(sessionID, func(cl *gemini.GeminiClient) (*gemini.GeminiResponse, error) {
+	var usedWorker *AccountWorker
+	resp, err := pool.ExecuteQueuedWithTier(ctx, sessionID, requiredTier, func(w *AccountWorker) (*gemini.GeminiResponse, error) {
+		usedWorker = w
 		if len(images) > 0 {
-			return cl.AskWithImages(prompt, images)
+			return w.Client.AskWithImagesModel(prompt, images, model)
 		}
-		return cl.Ask(prompt)
+		return w.Client.AskModel(prompt, model)
 	})
 
 	if err != nil {
@@ -230,29 +238,38 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 			UserSessions.Delete(sessionID)
 			return c.Status(504).JSON(fiber.Map{"error": "Request timed out. Session reset."})
 		}
+		if strings.Contains(strings.ToLower(err.Error()), "rate_limit") || strings.Contains(err.Error(), "429") || strings.Contains(strings.ToLower(err.Error()), "cooldown") {
+			return c.Status(429).JSON(fiber.Map{
+				"error": fiber.Map{
+					"message": err.Error(),
+					"type":    "rate_limit_error",
+					"code":    429,
+				},
+			})
+		}
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	if len(resp.Images) > 0 {
+	if len(resp.Images) > 0 && usedWorker != nil {
 		for i, imgURL := range resp.Images {
 			filename := fmt.Sprintf("img_%s_%d.png", resp.ResponseID, i)
 			if resp.ResponseID == "" {
 				filename = fmt.Sprintf("img_%d_%d.png", time.Now().Unix(), i)
 			}
-			if err := DownloadAndClean(client, imgURL, filename, "image"); err == nil {
+			if err := DownloadAndClean(usedWorker.Client, imgURL, filename, "image"); err == nil {
 				resp.Images[i] = fmt.Sprintf("http://%s/output/%s", c.Host(), filename)
 			}
 		}
 	}
 
-	if len(resp.Videos) > 0 {
+	if len(resp.Videos) > 0 && usedWorker != nil {
 		vidURL := resp.Videos[0]
 		if vidURL != "" && len(vidURL) > 50 {
 			filename := fmt.Sprintf("vid_%s_0.mp4", resp.ResponseID)
 			if resp.ResponseID == "" {
 				filename = fmt.Sprintf("vid_%d_0.mp4", time.Now().Unix())
 			}
-			if err := DownloadAndClean(client, vidURL, filename, "video"); err == nil {
+			if err := DownloadAndClean(usedWorker.Client, vidURL, filename, "video"); err == nil {
 				resp.Videos[0] = fmt.Sprintf("http://%s/output/%s", c.Host(), filename)
 			}
 		}
@@ -262,11 +279,17 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 	userIP := c.IP()
 	hostStr := c.Host()
 	go func() {
+		tier := "free"
+		accID := ""
+		if usedWorker != nil {
+			tier = usedWorker.Tier
+			accID = usedWorker.ID
+		}
 		pTokens := CountTokens(prompt)
 		rTokens := CountTokens(resp.Text)
-		db.LogMessage(resp.ConversationID, sessionID, "user", prompt, "gemini-3.8-flash", pTokens)
+		db.LogMessageWithTier(resp.ConversationID, sessionID, "user", prompt, model, pTokens, tier, accID)
 		if resp.Text != "" {
-			db.LogMessage(resp.ConversationID, sessionID, "assistant", resp.Text, "gemini-3.8-flash", rTokens)
+			db.LogMessageWithTier(resp.ConversationID, sessionID, "assistant", resp.Text, model, rTokens, tier, accID)
 		}
 		for _, imgURL := range resp.Images {
 			fName := filepath.Base(imgURL)
@@ -283,7 +306,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 	return c.JSON(resp)
 }
 
-// HandleOpenAIChatCompletions handles /v1/chat/completions with Needle 2 Native Tool Calling
+// HandleOpenAIChatCompletions handles /v1/chat/completions with Native Tool Calling & Output Arranger
 func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	var req OpenAIChatCompletionRequest
 	if err := c.Bind().JSON(&req); err != nil {
@@ -294,10 +317,9 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "Messages array is empty"})
 	}
 
-	model := req.Model
-	if model == "" || strings.Contains(model, "2.5") {
-		model = "gemini-3.8-flash"
-	}
+	modelCfg := gemini.GetModelRegistry().Resolve(req.Model)
+	model := modelCfg.ID
+	requiredTier := modelCfg.MinTier
 
 	var prompt string
 	hasToolResults := false
@@ -333,47 +355,10 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		}
 	}
 
-	// STEP 1: If tools provided and not yet executed, evaluate with Needle 2 C++ engine
-	if len(req.Tools) > 0 && !hasToolResults && prompt != "" {
-		engine, nErr := gemini.GetNeedleEngine()
-		if nErr == nil {
-			toolsJSON := FormatOpenAIToolsForNeedle(req.Tools)
-			needleResp, cErr := engine.CompleteTools(prompt, toolsJSON)
-			if cErr == nil && needleResp != nil && needleResp.Type == "call" && len(needleResp.FunctionCalls) > 0 {
-				var toolCalls []OpenAIToolCall
-				for _, fc := range needleResp.FunctionCalls {
-					argsBytes, _ := json.Marshal(fc.Arguments)
-					toolCalls = append(toolCalls, OpenAIToolCall{
-						ID:   "call_" + uuid.NewString()[:8],
-						Type: "function",
-						Function: OpenAIToolCallFunction{
-							Name:      fc.Name,
-							Arguments: string(argsBytes),
-						},
-					})
-				}
-
-				return c.JSON(OpenAIChatCompletionResponse{
-					ID:      "chatcmpl-" + uuid.NewString()[:12],
-					Object:  "chat.completion",
-					Created: time.Now().Unix(),
-					Model:   model,
-					Choices: []OpenAIChoice{
-						{
-							Index: 0,
-							Message: OpenAIChatMessage{
-								Role:      "assistant",
-								Content:   nil,
-								ToolCalls: toolCalls,
-							},
-							FinishReason: "tool_calls",
-						},
-					},
-				})
-			}
-		} else {
-			log.Printf("⚠️ Needle engine load notice: %v", nErr)
-		}
+	// Inject Tool Instructions into conversation if tools are provided
+	if len(req.Tools) > 0 {
+		toolInstruction := gemini.FormatToolsInstruction(req.Tools)
+		fullPromptBuilder.WriteString(toolInstruction)
 	}
 
 	// Multi-agent & session affinity resolution
@@ -398,8 +383,10 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	defer cancel()
 
 	askPrompt := prompt
-	if hasToolResults {
-		fullPromptBuilder.WriteString("Assistant: ")
+	if len(req.Messages) > 1 || hasToolResults || len(req.Tools) > 0 {
+		if hasToolResults {
+			fullPromptBuilder.WriteString("Assistant: ")
+		}
 		askPrompt = fullPromptBuilder.String()
 	}
 
@@ -414,9 +401,18 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		return c.SendStreamWriter(func(w *bufio.Writer) {
 			chunkID := "chatcmpl-" + uuid.NewString()[:12]
 			createdTime := time.Now().Unix()
+			var usedWorker *AccountWorker
+			var streamResp *gemini.GeminiResponse
+			var accumulatedOutput strings.Builder
 
-			streamErr := pool.ExecuteQueuedStream(ctx, sessionID, func(cl *gemini.GeminiClient) error {
-				_, err := cl.AskStream(askPrompt, func(chunk string) {
+			streamErr := pool.ExecuteQueuedStreamWithTier(ctx, sessionID, requiredTier, func(wWorker *AccountWorker) error {
+				usedWorker = wWorker
+				sr, err := wWorker.Client.AskStreamModel(askPrompt, model, func(chunk string) {
+					if len(req.Tools) > 0 {
+						// Buffer chunks when tools are requested to evaluate tool call
+						accumulatedOutput.WriteString(chunk)
+						return
+					}
 					chunkResp := OpenAIChatCompletionChunk{
 						ID:      chunkID,
 						Object:  "chat.completion.chunk",
@@ -435,12 +431,80 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 					fmt.Fprintf(w, "data: %s\n\n", data)
 					w.Flush()
 				})
+				streamResp = sr
 				return err
 			})
 
 			if streamErr != nil {
 				log.Printf("❌ Streaming error: %v", streamErr)
 				return
+			}
+
+			// If tools were provided, arrange and emit the structured result
+			finishReason := "stop"
+			var finalContentForLog string
+			if len(req.Tools) > 0 {
+				rawOutput := accumulatedOutput.String()
+				if streamResp != nil && streamResp.Text != "" && len(rawOutput) < len(streamResp.Text) {
+					rawOutput = streamResp.Text
+				}
+				arranged := gemini.ArrangeGeminiOutput(rawOutput)
+				finishReason = arranged.FinishReason
+				finalContentForLog = arranged.CleanText
+
+				if arranged.IsToolCall {
+					var toolCalls []OpenAIToolCall
+					for _, tc := range arranged.ToolCalls {
+						toolCalls = append(toolCalls, OpenAIToolCall{
+							ID:   tc.ID,
+							Type: tc.Type,
+							Function: OpenAIToolCallFunction{
+								Name:      tc.Function.Name,
+								Arguments: tc.Function.Arguments,
+							},
+						})
+					}
+					chunkResp := OpenAIChatCompletionChunk{
+						ID:      chunkID,
+						Object:  "chat.completion.chunk",
+						Created: createdTime,
+						Model:   model,
+						Choices: []OpenAIStreamChoice{
+							{
+								Index: 0,
+								Delta: OpenAIDelta{
+									Role:      "assistant",
+									ToolCalls: toolCalls,
+								},
+							},
+						},
+					}
+					data, _ := json.Marshal(chunkResp)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					w.Flush()
+				} else if arranged.CleanText != "" {
+					chunkResp := OpenAIChatCompletionChunk{
+						ID:      chunkID,
+						Object:  "chat.completion.chunk",
+						Created: createdTime,
+						Model:   model,
+						Choices: []OpenAIStreamChoice{
+							{
+								Index: 0,
+								Delta: OpenAIDelta{
+									Role:             "assistant",
+									Content:          arranged.CleanText,
+									ReasoningContent: arranged.ReasoningContent,
+								},
+							},
+						},
+					}
+					data, _ := json.Marshal(chunkResp)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					w.Flush()
+				}
+			} else if streamResp != nil {
+				finalContentForLog = streamResp.Text
 			}
 
 			finalResp := OpenAIChatCompletionChunk{
@@ -451,7 +515,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 				Choices: []OpenAIStreamChoice{
 					{
 						Index:        0,
-						FinishReason: "stop",
+						FinishReason: finishReason,
 					},
 				},
 			}
@@ -462,25 +526,87 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 
 			userIP := c.IP()
 			go func() {
+				tier := "free"
+				accID := ""
+				if usedWorker != nil {
+					tier = usedWorker.Tier
+					accID = usedWorker.ID
+				}
+				pTokens := CountTokens(prompt)
+				rTokens := CountTokens(finalContentForLog)
+				convID := ""
+				if streamResp != nil {
+					convID = streamResp.ConversationID
+				}
+				db.LogMessageWithTier(convID, sessionID, "user", prompt, model, pTokens, tier, accID)
+				if finalContentForLog != "" {
+					db.LogMessageWithTier(convID, sessionID, "assistant", finalContentForLog, model, rTokens, tier, accID)
+				}
 				db.LogRequest("/v1/chat/completions", "POST", userIP, 200, float64(time.Now().Unix()-createdTime)*1000)
 				AutoExportAnalytics()
 			}()
 		})
 	}
 
-	resp, err := pool.ExecuteQueued(ctx, sessionID, func(cl *gemini.GeminiClient) (*gemini.GeminiResponse, error) {
-		return cl.Ask(askPrompt)
+	var usedWorker *AccountWorker
+	resp, err := pool.ExecuteQueuedWithTier(ctx, sessionID, requiredTier, func(w *AccountWorker) (*gemini.GeminiResponse, error) {
+		usedWorker = w
+		return w.Client.AskModel(askPrompt, model)
 	})
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return c.Status(504).JSON(fiber.Map{"error": "Request timed out in worker queue."})
 		}
+		if strings.Contains(strings.ToLower(err.Error()), "rate_limit") || strings.Contains(err.Error(), "429") || strings.Contains(strings.ToLower(err.Error()), "cooldown") {
+			return c.Status(429).JSON(fiber.Map{
+				"error": fiber.Map{
+					"message": err.Error(),
+					"type":    "rate_limit_error",
+					"code":    429,
+				},
+			})
+		}
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	respContent := resp.Text
+	arranged := gemini.ArrangeGeminiOutput(resp.Text)
 	pTokens := CountTokens(prompt)
-	cTokens := CountTokens(respContent)
+	cTokens := CountTokens(arranged.CleanText)
+
+	var message OpenAIChatMessage
+	if arranged.IsToolCall {
+		var toolCalls []OpenAIToolCall
+		for _, tc := range arranged.ToolCalls {
+			toolCalls = append(toolCalls, OpenAIToolCall{
+				ID:   tc.ID,
+				Type: tc.Type,
+				Function: OpenAIToolCallFunction{
+					Name:      tc.Function.Name,
+					Arguments: tc.Function.Arguments,
+				},
+			})
+		}
+		message = OpenAIChatMessage{
+			Role:      "assistant",
+			Content:   nil,
+			ToolCalls: toolCalls,
+		}
+		if arranged.ReasoningContent != "" {
+			rc := arranged.ReasoningContent
+			message.ReasoningContent = &rc
+		}
+	} else {
+		cleanText := arranged.CleanText
+		message = OpenAIChatMessage{
+			Role:    "assistant",
+			Content: &cleanText,
+		}
+		if arranged.ReasoningContent != "" {
+			rc := arranged.ReasoningContent
+			message.ReasoningContent = &rc
+		}
+	}
+
 	openAIResp := OpenAIChatCompletionResponse{
 		ID:      "chatcmpl-" + uuid.NewString()[:12],
 		Object:  "chat.completion",
@@ -488,12 +614,9 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		Model:   model,
 		Choices: []OpenAIChoice{
 			{
-				Index: 0,
-				Message: OpenAIChatMessage{
-					Role:    "assistant",
-					Content: &respContent,
-				},
-				FinishReason: "stop",
+				Index:        0,
+				Message:      message,
+				FinishReason: arranged.FinishReason,
 			},
 		},
 		Usage: &OpenAIUsage{
@@ -506,9 +629,15 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	// Save to SQLite database asynchronously & auto-export Excel
 	userIP := c.IP()
 	go func() {
-		db.LogMessage(resp.ConversationID, sessionID, "user", prompt, model, pTokens)
-		if respContent != "" {
-			db.LogMessage(resp.ConversationID, sessionID, "assistant", respContent, model, cTokens)
+		tier := "free"
+		accID := ""
+		if usedWorker != nil {
+			tier = usedWorker.Tier
+			accID = usedWorker.ID
+		}
+		db.LogMessageWithTier(resp.ConversationID, sessionID, "user", prompt, model, pTokens, tier, accID)
+		if arranged.CleanText != "" {
+			db.LogMessageWithTier(resp.ConversationID, sessionID, "assistant", arranged.CleanText, model, cTokens, tier, accID)
 		}
 		db.LogRequest("/v1/chat/completions", "POST", userIP, 200, resp.Elapsed*1000)
 		AutoExportAnalytics()

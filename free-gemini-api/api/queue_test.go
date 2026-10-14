@@ -193,3 +193,124 @@ func TestWorkerPool_ConcurrentStress(t *testing.T) {
 		t.Errorf("Expected TotalInFlight = 0 after all operations, got %d", stats.TotalInFlight)
 	}
 }
+
+func TestWorkerPool_TierRouting(t *testing.T) {
+	pool := &WorkerPool{
+		maxConcurrencyPerWorker: 2,
+		workers: []*AccountWorker{
+			{
+				ID:         "free_worker_1",
+				CookiePath: "cookies/account_1.json",
+				Client:     &gemini.GeminiClient{},
+				Status:     "active",
+				Tier:       "free",
+				LastUsed:   time.Now(),
+			},
+			{
+				ID:         "sub_worker_1",
+				CookiePath: "cookies/account_pro.json",
+				Client:     &gemini.GeminiClient{},
+				Status:     "active",
+				Tier:       "subscription",
+				LastUsed:   time.Now(),
+			},
+		},
+	}
+	ctx := context.Background()
+
+	// 1. Verify Pool Stats calculates free and subscription workers correctly
+	stats := pool.GetStats()
+	if stats.FreeWorkers != 1 {
+		t.Errorf("Expected 1 free worker, got %d", stats.FreeWorkers)
+	}
+	if stats.SubscriptionWorkers != 1 {
+		t.Errorf("Expected 1 subscription worker, got %d", stats.SubscriptionWorkers)
+	}
+
+	// 2. Acquire free worker
+	wFree, err := pool.AcquireWorkerWithTier(ctx, "", "free")
+	if err != nil {
+		t.Fatalf("Failed to acquire free worker: %v", err)
+	}
+	if wFree.Tier != "free" {
+		t.Errorf("Expected free worker, got tier: %s (id: %s)", wFree.Tier, wFree.ID)
+	}
+	pool.ReleaseWorker(wFree, nil)
+
+	// 3. Acquire subscription worker
+	wSub, err := pool.AcquireWorkerWithTier(ctx, "", "subscription")
+	if err != nil {
+		t.Fatalf("Failed to acquire subscription worker: %v", err)
+	}
+	if wSub.Tier != "subscription" {
+		t.Errorf("Expected subscription worker, got tier: %s (id: %s)", wSub.Tier, wSub.ID)
+	}
+	pool.ReleaseWorker(wSub, nil)
+
+	// 4. Test missing subscription worker error
+	poolOnlyFree := &WorkerPool{
+		maxConcurrencyPerWorker: 2,
+		workers: []*AccountWorker{
+			{
+				ID:         "free_worker_only",
+				CookiePath: "cookies/account_1.json",
+				Client:     &gemini.GeminiClient{},
+				Status:     "active",
+				Tier:       "free",
+				LastUsed:   time.Now(),
+			},
+		},
+	}
+	_, errMissingSub := poolOnlyFree.AcquireWorkerWithTier(ctx, "", "subscription")
+	if errMissingSub == nil {
+		t.Errorf("Expected error requesting subscription model without subscription accounts in pool, got nil")
+	}
+}
+
+func TestWorkerPool_TierFallback(t *testing.T) {
+	// A pool with 1 free worker and 1 subscription worker
+	wFree := &AccountWorker{
+		ID:         "free_worker_1",
+		CookiePath: "cookies/account_1.json",
+		Client:     &gemini.GeminiClient{},
+		Status:     "active",
+		Tier:       "free",
+		LastUsed:   time.Now(),
+	}
+	wSub := &AccountWorker{
+		ID:         "sub_worker_1",
+		CookiePath: "cookies/account_sub.json",
+		Client:     &gemini.GeminiClient{},
+		Status:     "active",
+		Tier:       "subscription",
+		LastUsed:   time.Now(),
+	}
+
+	pool := &WorkerPool{
+		maxConcurrencyPerWorker: 1, // Max 1 concurrency so it becomes busy immediately
+		workers:                 []*AccountWorker{wFree, wSub},
+	}
+	ctx := context.Background()
+
+	// Fill the free worker
+	w1, err := pool.AcquireWorkerWithTier(ctx, "", "free")
+	if err != nil {
+		t.Fatalf("Failed to acquire first free worker: %v", err)
+	}
+	if w1.ID != "free_worker_1" {
+		t.Errorf("Expected free_worker_1, got %s", w1.ID)
+	}
+
+	// Second request for free model should fall back to subscription worker (since free worker is at max concurrency)
+	w2, err := pool.AcquireWorkerWithTier(ctx, "", "free")
+	if err != nil {
+		t.Fatalf("Failed to acquire second worker: %v", err)
+	}
+	if w2.ID != "sub_worker_1" {
+		t.Errorf("Expected fallback to sub_worker_1, got %s", w2.ID)
+	}
+
+	// Release both
+	pool.ReleaseWorker(w1, nil)
+	pool.ReleaseWorker(w2, nil)
+}

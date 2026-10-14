@@ -19,7 +19,7 @@ func RegisterRoutes(app *fiber.App) {
 		cookieHealth := gemini.InspectAccountCookieHealth()
 		return c.JSON(fiber.Map{
 			"status":                   "online",
-			"engine":                   "needle2 + free-gemini-api (pure go)",
+			"engine":                   "arranger + free-gemini-api (pure go)",
 			"cookie_health":            cookieHealth,
 			"active_extension_workers": gemini.GetActiveWorkerCount(),
 			"cookie_accounts_in_pool":  gemini.GetActiveAccountCount(),
@@ -73,18 +73,66 @@ func RegisterRoutes(app *fiber.App) {
 		return c.JSON(resp)
 	})
 
-	// OpenAI-compatible models list
+	// OpenAI-compatible models list (dynamically loaded from Model Registry)
 	app.Get("/v1/models", func(c fiber.Ctx) error {
+		reg := gemini.GetModelRegistry()
+		models := reg.GetAll()
+		var list []fiber.Map
+		for _, m := range models {
+			list = append(list, fiber.Map{
+				"id":           m.ID,
+				"object":       "model",
+				"created":      1710000000,
+				"owned_by":     "google",
+				"display_name": m.DisplayName,
+				"description":  m.Description,
+				"min_tier":     m.MinTier,
+				"mode_id":      m.ModeID,
+				"is_default":   m.IsDefault,
+				"capabilities": m.Capabilities,
+				"aliases":      m.Aliases,
+				"source":       m.Source,
+			})
+		}
 		return c.JSON(fiber.Map{
 			"object": "list",
-			"data": []fiber.Map{
-				{"id": "gemini-3.8-flash", "object": "model", "owned_by": "free-gemini-api"},
-				{"id": "gemini-3.7-flash", "object": "model", "owned_by": "free-gemini-api"},
-			},
+			"data":   list,
 		})
 	})
 
-	// OpenAI-compatible chat completions (with Native Needle 2 Tool Calling)
+	// Dynamic registration/addition of custom models and mode hashes at runtime
+	app.Post("/v1/models", func(c fiber.Ctx) error {
+		var cfg gemini.ModelConfig
+		if err := c.Bind().JSON(&cfg); err != nil || cfg.ID == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid model config payload. 'id' is required."})
+		}
+		if cfg.DisplayName == "" {
+			cfg.DisplayName = cfg.ID
+		}
+		if cfg.MinTier == "" {
+			cfg.MinTier = "free"
+		}
+		if cfg.Source == "" {
+			cfg.Source = "custom"
+		}
+		gemini.GetModelRegistry().Register(cfg)
+		return c.JSON(fiber.Map{
+			"status":  "success",
+			"message": "Model registered successfully",
+			"model":   cfg,
+		})
+	})
+
+	// Autonomous Model Discovery across all connected accounts
+	app.Post("/v1/models/discover", func(c fiber.Ctx) error {
+		res, err := GetWorkerPool().DiscoverModelsFromWorkers()
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(res)
+	})
+
+	// OpenAI-compatible chat completions (with Native Tool Calling & Output Arranger)
 	app.Post("/v1/chat/completions", HandleOpenAIChatCompletions)
 
 	// Unified chat endpoint (text, images, screen recordings, ref videos)
