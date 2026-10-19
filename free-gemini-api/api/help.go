@@ -28,9 +28,17 @@ CORE API ENDPOINTS:
   GET  /stats                 Real-time SQLite database, Free vs Subscription tier breakdown
   GET  /v1/analytics          Machine-readable JSON analytics export
   GET  /export/excel          Download comprehensive Excel intelligence report (.xlsx)
-  GET  /health                Cookie health, TTL inspector & extension status
+  GET  /health                Bridge reachability; pool internals need the bridge token
+  POST /api/sync-cookies      Cookie bridge ingest (requires the bridge token)
   POST /reset                 Reset an active agent/user session
   GET  /help                  Display this CLI developer manual
+
+COOKIE BRIDGE SECURITY:
+  The Chrome extension pushes full Google session cookies into this server.
+  Both ingest paths (ws://127.0.0.1:9226 and POST /api/sync-cookies) require a
+  shared secret, printed once at startup and stored in cookies/.bridge_token.
+  Override it with BRIDGE_TOKEN=... ; set BRIDGE_BIND=127.0.0.1 to keep the
+  bridge off the network entirely. Never expose this port to the internet.
 
 MULTI-AGENT HEADERS:
   X-Agent-ID: <id>            Sticky affinity binding (Keeps agent thread with same account)
@@ -124,7 +132,8 @@ func HandleHelp(c fiber.Ctx) error {
 				{"method": "GET", "path": "/stats", "description": "Real-time SQLite database analytics"},
 				{"method": "GET", "path": "/v1/analytics", "description": "Machine-readable JSON analytics export"},
 				{"method": "GET", "path": "/export/excel", "description": "Download comprehensive Excel report (.xlsx)"},
-				{"method": "GET", "path": "/health", "description": "Cookie health, TTL inspector & extension status"},
+				{"method": "GET", "path": "/health", "description": "Bridge reachability; pool internals require the bridge token"},
+				{"method": "POST", "path": "/api/sync-cookies", "description": "Cookie bridge ingest (requires the bridge token)"},
 				{"method": "GET", "path": "/help", "description": "CLI Developer manual and help"},
 			},
 			"multi_agent_headers": []string{"X-Agent-ID", "X-Session-ID", "X-Conversation-ID"},

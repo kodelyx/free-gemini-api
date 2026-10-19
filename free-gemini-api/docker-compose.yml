@@ -12,3 +12,13 @@ services:
       - "9226:9226"
     environment:
       - TZ=Asia/Kolkata
+      # Shared secret for the cookie bridge. Leave it unset and the server mints
+      # one into cookies/.bridge_token on first start (persisted by the volume
+      # below, so pairing the extension survives restarts).
+      # - BRIDGE_TOKEN=replace-with-a-long-random-value
+      # Single-machine setups can keep the bridge off the network entirely:
+      # - BRIDGE_BIND=127.0.0.1
+    volumes:
+      # Session cookies and the bridge token must not vanish on `docker compose up --build`.
+      - ./cookies:/app/cookies
+      - ./data:/app/data

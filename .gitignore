@@ -11,6 +11,8 @@ main
 # Private session cookies
 **/cookies/*.json
 !**/cookies/.gitkeep
+# Cookie-bridge pairing secret (local-only, never committed)
+**/cookies/.bridge_token
 
 # SQLite databases
 **/*.db

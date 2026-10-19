@@ -185,13 +185,22 @@ func StartCookieWatchdog() {
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	// Only extension contexts and loopback web pages may open the bridge.
+	// This used to `return true` for every Origin, which let any page the user
+	// visited talk to the local cookie pool from their own browser.
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow Chrome Extension context
+		origin := r.Header.Get("Origin")
+		if BridgeOriginAllowed(origin) {
+			return true
+		}
+		log.Printf("🚫 Cookie bridge rejected handshake from Origin %q", origin)
+		return false
 	},
 }
 
 type ExtensionMessage struct {
 	Type    string         `json:"type"`
+	Token   string         `json:"token,omitempty"`
 	Cookies []CookieObject `json:"cookies"`
 }
 
@@ -287,6 +296,71 @@ func ProcessAndSaveCookies(cookies []CookieObject, profileID *int) (string, stri
 	return accountFilePath, accountID, nil
 }
 
+// bridgeAuthTimeout bounds how long a fresh client may take to prove it holds
+// the shared secret before the socket is dropped.
+const bridgeAuthTimeout = 5 * time.Second
+
+// authenticateBridgeConnection enforces the shared secret on a new WebSocket
+// connection (issue #1: the bridge previously accepted any client that could
+// reach the port and let it write straight into the cookie pool).
+//
+// The secret may arrive as an X-Bridge-Token / Authorization header or ?token=
+// for non-browser clients; otherwise the first frame must be
+// {"type":"auth","token":"..."} within bridgeAuthTimeout, which is what the
+// Chrome extension sends (a WebSocket cannot set custom headers from the
+// browser). On success the server echoes a fingerprint of the secret so the
+// client can verify it reached the real server rather than a LAN impostor.
+func authenticateBridgeConnection(conn *websocket.Conn, r *http.Request) bool {
+	if BridgeTokenDisabled() {
+		return true
+	}
+
+	token := ExtractBridgeToken(r)
+	if token == "" {
+		_ = conn.SetReadDeadline(time.Now().Add(bridgeAuthTimeout))
+		_, frame, err := conn.ReadMessage()
+		if err != nil {
+			log.Printf("🚫 Cookie bridge client %s closed before authenticating: %v", r.RemoteAddr, err)
+			closeBridgeConn(conn, "authentication_required")
+			return false
+		}
+		var authMsg ExtensionMessage
+		if err := json.Unmarshal(frame, &authMsg); err == nil && authMsg.Type == "auth" {
+			token = strings.TrimSpace(authMsg.Token)
+		}
+	}
+
+	if !BridgeTokenMatches(token) {
+		log.Printf("🚫 Cookie bridge rejected unauthenticated client from %s (no valid %s)", r.RemoteAddr, BridgeTokenHeader)
+		closeBridgeConn(conn, "unauthorized")
+		return false
+	}
+
+	_ = conn.SetReadDeadline(time.Time{})
+	if err := conn.WriteJSON(map[string]string{
+		"type":        "auth_ok",
+		"fingerprint": BridgeTokenFingerprint(),
+	}); err != nil {
+		log.Printf("❌ Cookie bridge could not confirm authentication to %s: %v", r.RemoteAddr, err)
+		conn.Close()
+		return false
+	}
+
+	log.Printf("🔐 Cookie bridge client authenticated from %s", r.RemoteAddr)
+	return true
+}
+
+// closeBridgeConn tells the client why it was dropped before hanging up.
+func closeBridgeConn(conn *websocket.Conn, reason string) {
+	_ = conn.WriteJSON(map[string]string{"type": "error", "error": reason})
+	_ = conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason),
+		time.Now().Add(time.Second),
+	)
+	conn.Close()
+}
+
 // StartCookieWebSocketServer starts a local WebSocket server to receive cookies from the extension
 func StartCookieWebSocketServer(port int) {
 	mux := http.NewServeMux()
@@ -294,6 +368,13 @@ func StartCookieWebSocketServer(port int) {
 		conn, err := wsUpgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Printf("❌ WS Upgrade failed: %v", err)
+			return
+		}
+
+		// Shared-secret gate (issue #1). Anyone who can reach this port used to
+		// be able to write straight into the cookie pool by answering a
+		// discovery probe; now they have to hold the pairing secret first.
+		if !authenticateBridgeConnection(conn, r) {
 			return
 		}
 
@@ -346,7 +427,8 @@ func StartCookieWebSocketServer(port int) {
 		}
 	})
 
-	addr := fmt.Sprintf("0.0.0.0:%d", port)
+	addr := BridgeBindAddress(port)
+	LogBridgeSecurityState(addr)
 	log.Printf("📡 Cookie WebSocket Server listening on %s", addr)
 
 	server := &http.Server{

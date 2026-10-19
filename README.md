@@ -37,7 +37,7 @@ Until now, Argon's thinking controls were locked behind Google's internal web in
 | **⚡ Gemini 3.8 Flash Default** | `gemini-3.8-flash` is set as the default model (`is_default: true`) for instant sub-second completions without configuration. |
 | **🔌 Drop-In OpenAI Standard** | Seamlessly connects with **Cursor**, **Cline**, **NextChat**, **OpenWebUI**, **LangChain**, and the standard OpenAI Python / JS SDKs. |
 | **🛡️ Distributed Account Pooling** | Connect 1 to 100+ Google accounts to load-balance requests with least-busy routing and automatic rate-limit cooldown management. |
-| **🍪 Zero-Touch Cookie Bridge** | Companion Chrome extension automatically discovers the local server and syncs session credentials with zero tab manipulation. |
+| **🍪 Zero-Touch Cookie Bridge** | Companion Chrome extension syncs session credentials with zero tab manipulation — over a token-authenticated, loopback-by-default bridge. |
 | **🚀 Pure Go HTTP/3 QUIC** | State-of-the-art TLS 1.3 fingerprint simulation (Chrome 152 JA4) with 0-RTT session resumption for ultra-low latency. |
 | **📊 Dual Intelligence Analytics** | Real-time SQLite WAL storage tracking token usage, latency, and estimated cost-savings exported directly to JSON and Excel (`.xlsx`). |
 
@@ -79,13 +79,18 @@ The server listens on **`http://127.0.0.1:8001`** (API) and **`ws://127.0.0.1:92
 
 ---
 
-### 2. Connect Your Account (Zero-Touch)
+### 2. Connect Your Account (One-Time Pairing)
 
 1. Open `chrome://extensions/` in Chrome.
 2. Toggle **Developer mode** on (top-right).
 3. Click **Load unpacked** and select the [`gemini-extension/`](./gemini-extension) folder.
-4. Log into [gemini.google.com](https://gemini.google.com).
-5. The extension automatically detects your session and streams the worker credentials to the local API pool.
+4. Copy the bridge token the server printed at startup (also stored in `cookies/.bridge_token`).
+5. Click the extension icon, paste the token into **Bridge token**, press **Save Connection**.
+6. Log into [gemini.google.com](https://gemini.google.com). The extension streams your session to the
+   local API pool and shows **Paired** — until a token is saved it sends nothing.
+
+> The token is the only authentication the cookie bridge has. Treat it like a password: it is what
+> stops another device on your network from feeding the pool forged sessions or reading its state.
 
 ---
 
@@ -241,9 +246,35 @@ main();
 
 ## 🔒 Security & Privacy
 
+The companion extension ships **full Google session cookies** — anyone who receives them can
+impersonate the signed-in account. The bridge is therefore authenticated, not merely local:
+
+- **Token-Authenticated Bridge (required)**: both cookie-ingest paths — `ws://127.0.0.1:9226` and
+  `POST /api/sync-cookies` — require a shared secret. The server generates one on first run,
+  stores it in `cookies/.bridge_token` (mode `600`), and prints it once at startup:
+  paste it into the extension popup. No token, no cookies accepted.
+- **No LAN Sweep in the Extension**: the extension only talks to `127.0.0.1` / `localhost`, or to a
+  host you type in yourself (which requires ticking *allow non-local host*). It no longer probes
+  hardcoded IPs or sweeps `192.168.1.1-254` for anything answering `/health`, so a device sharing
+  your Wi-Fi can no longer harvest a session by answering a probe.
+- **Origin-Checked WebSocket**: the bridge rejects handshakes from non-loopback web origins, so a
+  page you visit cannot drive the bridge from your own browser.
+- **Verified Server Identity**: before it transmits anything the extension sends a random nonce and
+  requires an HMAC-SHA256 proof of the bridge token back (`/health?nonce=…`). The token itself is
+  never sent to a host that has not proven it holds it, and a proof captured from an earlier probe
+  is useless because every probe uses a fresh nonce — a listener that merely answers `/health` gets
+  nothing.
+- **Minimal Host Permissions**: the extension declares loopback host permissions plus Google
+  domains; any other host is an opt-in runtime permission.
+- **Locked Down `/health`**: pool internals (account count, cookie TTL, worker count) are only
+  returned to clients that present the token.
+- **Binds**: `BRIDGE_BIND=127.0.0.1` keeps the bridge off the network entirely.
 - **Zero Hardcoded Secrets**: Credentials and cookies are held strictly in local files and memory; nothing is sent to external third-party servers.
-- **Local Network Isolation**: All WebSocket discovery and cookie sync happen strictly over localhost or local subnet.
 - **Safe Version Control**: Pre-configured `.gitignore` prevents private Google session tokens and cookies from ever being committed.
+
+> ⚠️ This project drives Google's web interface with an authenticated session. Doing so may violate
+> Google's Terms of Service and can get an account rate-limited or restricted. Use your own accounts,
+> and only on a machine and network you control.
 
 ---
 
