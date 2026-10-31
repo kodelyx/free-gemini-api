@@ -138,6 +138,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 		c.Set("Cache-Control", "no-cache")
 		c.Set("Connection", "keep-alive")
 		c.Set("X-Accel-Buffering", "no")
+		
 
 		return c.SendStreamWriter(func(w *bufio.Writer) {
 			var usedWorker *AccountWorker
@@ -379,8 +380,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		sessionID = c.IP()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	
 
 	askPrompt := prompt
 	if len(req.Messages) > 1 || hasToolResults || len(req.Tools) > 0 {
@@ -391,14 +391,25 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	}
 
 	pool := GetWorkerPool()
-
+	log.Printf(
+    "[STREAM DEBUG] model=%s stream=%v tools=%d messages=%d",
+    req.Model,
+    req.Stream,
+    len(req.Tools),
+    len(req.Messages),
+)
 	if req.Stream {
 		c.Set("Content-Type", "text/event-stream")
 		c.Set("Cache-Control", "no-cache")
 		c.Set("Connection", "keep-alive")
 		c.Set("X-Accel-Buffering", "no")
+		clientIP := c.IP()
 
 		return c.SendStreamWriter(func(w *bufio.Writer) {
+			
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			
 			chunkID := "chatcmpl-" + uuid.NewString()[:12]
 			createdTime := time.Now().Unix()
 			var usedWorker *AccountWorker
@@ -524,7 +535,8 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			w.Flush()
 
-			userIP := c.IP()
+			userIP := clientIP
+			log.Printf("Client IP: %s", userIP)
 			go func() {
 				tier := "free"
 				accID := ""
@@ -548,6 +560,8 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		})
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
 	var usedWorker *AccountWorker
 	resp, err := pool.ExecuteQueuedWithTier(ctx, sessionID, requiredTier, func(w *AccountWorker) (*gemini.GeminiResponse, error) {
 		usedWorker = w
