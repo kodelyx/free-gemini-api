@@ -138,6 +138,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 		c.Set("Cache-Control", "no-cache")
 		c.Set("Connection", "keep-alive")
 		c.Set("X-Accel-Buffering", "no")
+		
 
 		return c.SendStreamWriter(func(w *bufio.Writer) {
 			var usedWorker *AccountWorker
@@ -379,8 +380,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		sessionID = c.IP()
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	
 
 	askPrompt := prompt
 	if len(req.Messages) > 1 || hasToolResults || len(req.Tools) > 0 {
@@ -391,121 +391,163 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	}
 
 	pool := GetWorkerPool()
-
+	log.Printf(
+    "[STREAM DEBUG] model=%s stream=%v tools=%d messages=%d",
+    req.Model,
+    req.Stream,
+    len(req.Tools),
+    len(req.Messages),
+)
 	if req.Stream {
 		c.Set("Content-Type", "text/event-stream")
 		c.Set("Cache-Control", "no-cache")
 		c.Set("Connection", "keep-alive")
 		c.Set("X-Accel-Buffering", "no")
+		clientIP := c.IP()
 
 		return c.SendStreamWriter(func(w *bufio.Writer) {
+			
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			
 			chunkID := "chatcmpl-" + uuid.NewString()[:12]
 			createdTime := time.Now().Unix()
 			var usedWorker *AccountWorker
 			var streamResp *gemini.GeminiResponse
-			var accumulatedOutput strings.Builder
+			
+var accumulatedOutput strings.Builder
 
-			streamErr := pool.ExecuteQueuedStreamWithTier(ctx, sessionID, requiredTier, func(wWorker *AccountWorker) error {
-				usedWorker = wWorker
-				sr, err := wWorker.Client.AskStreamModel(askPrompt, model, func(chunk string) {
-					if len(req.Tools) > 0 {
-						// Buffer chunks when tools are requested to evaluate tool call
-						accumulatedOutput.WriteString(chunk)
-						return
-					}
-					chunkResp := OpenAIChatCompletionChunk{
-						ID:      chunkID,
-						Object:  "chat.completion.chunk",
-						Created: createdTime,
-						Model:   model,
-						Choices: []OpenAIStreamChoice{
-							{
-								Index: 0,
-								Delta: OpenAIDelta{
-									Content: chunk,
-								},
-							},
-						},
-					}
-					data, _ := json.Marshal(chunkResp)
-					fmt.Fprintf(w, "data: %s\n\n", data)
-					w.Flush()
-				})
-				streamResp = sr
-				return err
-			})
+sendStreamDelta := func(content, reasoning string) {
+    delta := OpenAIDelta{}
 
-			if streamErr != nil {
-				log.Printf("❌ Streaming error: %v", streamErr)
-				return
-			}
+    if content != "" {
+        delta.Content = content
+    }
+    if reasoning != "" {
+        delta.ReasoningContent = reasoning
+    }
+
+    chunkResp := OpenAIChatCompletionChunk{
+        ID:      chunkID,
+        Object:  "chat.completion.chunk",
+        Created: createdTime,
+        Model:   model,
+        Choices: []OpenAIStreamChoice{
+            {
+                Index: 0,
+                Delta: delta,
+            },
+        },
+    }
+
+    data, _ := json.Marshal(chunkResp)
+    fmt.Fprintf(w, "data: %s\n\n", data)
+    w.Flush()
+}
+
+var streamParser *incrementalStreamParser
+
+if len(req.Tools) > 0 {
+    streamParser = newIncrementalStreamParser(
+        func(text string) {
+            sendStreamDelta(text, "")
+        },
+        func(thought string) {
+            sendStreamDelta("", thought)
+        },
+    )
+}
+
+// Execute Gemini streaming request.
+streamErr := pool.ExecuteQueuedStreamWithTier(
+    ctx,
+    sessionID,
+    requiredTier,
+    func(wWorker *AccountWorker) error {
+        usedWorker = wWorker
+
+        sr, err := wWorker.Client.AskStreamModel(
+            askPrompt,
+            model,
+            func(chunk string) {
+                if streamParser != nil {
+                    accumulatedOutput.WriteString(chunk)
+                    streamParser.Write(chunk)
+                    return
+                }
+
+                sendStreamDelta(chunk, "")
+            },
+        )
+
+        streamResp = sr
+        return err
+    },
+)
+
+if streamErr != nil {
+    log.Printf("❌ Streaming error: %v", streamErr)
+    return
+}
+
+// Flush any remaining parser content.
+if streamParser != nil {
+    streamParser.Finish()
+}
+
 
 			// If tools were provided, arrange and emit the structured result
 			finishReason := "stop"
-			var finalContentForLog string
-			if len(req.Tools) > 0 {
-				rawOutput := accumulatedOutput.String()
-				if streamResp != nil && streamResp.Text != "" && len(rawOutput) < len(streamResp.Text) {
-					rawOutput = streamResp.Text
-				}
-				arranged := gemini.ArrangeGeminiOutput(rawOutput)
-				finishReason = arranged.FinishReason
-				finalContentForLog = arranged.CleanText
+var finalContentForLog string
 
-				if arranged.IsToolCall {
-					var toolCalls []OpenAIToolCall
-					for _, tc := range arranged.ToolCalls {
-						toolCalls = append(toolCalls, OpenAIToolCall{
-							ID:   tc.ID,
-							Type: tc.Type,
-							Function: OpenAIToolCallFunction{
-								Name:      tc.Function.Name,
-								Arguments: tc.Function.Arguments,
-							},
-						})
-					}
-					chunkResp := OpenAIChatCompletionChunk{
-						ID:      chunkID,
-						Object:  "chat.completion.chunk",
-						Created: createdTime,
-						Model:   model,
-						Choices: []OpenAIStreamChoice{
-							{
-								Index: 0,
-								Delta: OpenAIDelta{
-									Role:      "assistant",
-									ToolCalls: toolCalls,
-								},
-							},
-						},
-					}
-					data, _ := json.Marshal(chunkResp)
-					fmt.Fprintf(w, "data: %s\n\n", data)
-					w.Flush()
-				} else if arranged.CleanText != "" {
-					chunkResp := OpenAIChatCompletionChunk{
-						ID:      chunkID,
-						Object:  "chat.completion.chunk",
-						Created: createdTime,
-						Model:   model,
-						Choices: []OpenAIStreamChoice{
-							{
-								Index: 0,
-								Delta: OpenAIDelta{
-									Role:             "assistant",
-									Content:          arranged.CleanText,
-									ReasoningContent: arranged.ReasoningContent,
-								},
-							},
-						},
-					}
-					data, _ := json.Marshal(chunkResp)
-					fmt.Fprintf(w, "data: %s\n\n", data)
-					w.Flush()
-				}
-			} else if streamResp != nil {
-				finalContentForLog = streamResp.Text
-			}
+if len(req.Tools) > 0 {
+    rawOutput := accumulatedOutput.String()
+
+    if streamResp != nil && streamResp.Text != "" && len(rawOutput) < len(streamResp.Text) {
+        rawOutput = streamResp.Text
+    }
+
+    arranged := gemini.ArrangeGeminiOutput(rawOutput)
+    finishReason = arranged.FinishReason
+    finalContentForLog = arranged.CleanText
+
+    if arranged.IsToolCall {
+        var toolCalls []OpenAIToolCall
+
+        for _, tc := range arranged.ToolCalls {
+            toolCalls = append(toolCalls, OpenAIToolCall{
+                ID:   tc.ID,
+                Type: tc.Type,
+                Function: OpenAIToolCallFunction{
+                    Name:      tc.Function.Name,
+                    Arguments: tc.Function.Arguments,
+                },
+            })
+        }
+
+        chunkResp := OpenAIChatCompletionChunk{
+            ID:      chunkID,
+            Object:  "chat.completion.chunk",
+            Created: createdTime,
+            Model:   model,
+            Choices: []OpenAIStreamChoice{
+                {
+                    Index: 0,
+                    Delta: OpenAIDelta{
+                        Role:      "assistant",
+                        ToolCalls: toolCalls,
+                    },
+                },
+            },
+        }
+
+        data, _ := json.Marshal(chunkResp)
+        fmt.Fprintf(w, "data: %s\n\n", data)
+        w.Flush()
+    }
+} else if streamResp != nil {
+    finalContentForLog = streamResp.Text
+}
 
 			finalResp := OpenAIChatCompletionChunk{
 				ID:      chunkID,
@@ -524,7 +566,8 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			w.Flush()
 
-			userIP := c.IP()
+			userIP := clientIP
+			log.Printf("Client IP: %s", userIP)
 			go func() {
 				tier := "free"
 				accID := ""
@@ -548,6 +591,8 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		})
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
 	var usedWorker *AccountWorker
 	resp, err := pool.ExecuteQueuedWithTier(ctx, sessionID, requiredTier, func(w *AccountWorker) (*gemini.GeminiResponse, error) {
 		usedWorker = w

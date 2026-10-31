@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"bufio"
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -667,37 +668,53 @@ func (c *GeminiClient) doStreamRequestHTTP2(fullURL string, data url.Values, mod
 	return c.readAndProcessStream(resp.Body, onChunk)
 }
 
-func (c *GeminiClient) readAndProcessStream(body io.Reader, onChunk func(text string)) (string, error) {
-	bodyBytes, err := io.ReadAll(body)
-	if err != nil {
-		return "", err
-	}
-	rawBody := string(bodyBytes)
+func (c *GeminiClient) readAndProcessStream(
+    body io.Reader,
+    onChunk func(text string),
+) (string, error) {
+    reader := bufio.NewReader(body)
 
-	prevText := ""
-	lines := strings.Split(rawBody, "\n")
-	for i := 0; i < len(lines); i++ {
-		line := strings.TrimSpace(lines[i])
-		if !strings.HasPrefix(line, "[[\"wrb.fr\"") {
-			continue
-		}
+    var rawBody strings.Builder
+    prevText := ""
 
-		tempResp := &GeminiResponse{}
-		parseResponse(line, tempResp)
+    for {
+        line, err := reader.ReadString('\n')
 
-		if tempResp.Text != "" && tempResp.Text != prevText {
-			delta := tempResp.Text
-			if strings.HasPrefix(delta, prevText) {
-				delta = delta[len(prevText):]
-			}
-			if delta != "" && onChunk != nil {
-				onChunk(delta)
-			}
-			prevText = tempResp.Text
-		}
-	}
+        if len(line) > 0 {
+            rawBody.WriteString(line)
 
-	return rawBody, nil
+            trimmed := strings.TrimSpace(line)
+
+            if strings.HasPrefix(trimmed, "[[") {
+                tempResp := &GeminiResponse{}
+                parseResponse(trimmed, tempResp)
+
+                if tempResp.Text != "" && tempResp.Text != prevText {
+                    delta := tempResp.Text
+
+                    if strings.HasPrefix(delta, prevText) {
+                        delta = delta[len(prevText):]
+                    }
+
+                    if delta != "" && onChunk != nil {
+                        onChunk(delta)
+                    }
+
+                    prevText = tempResp.Text
+                }
+            }
+        }
+
+        if err != nil {
+            if err == io.EOF {
+                break
+            }
+
+            return rawBody.String(), err
+        }
+    }
+
+    return rawBody.String(), nil
 }
 
 func (c *GeminiClient) UploadImage(imageBytes []byte, filename string, mimeType string) (string, error) {
