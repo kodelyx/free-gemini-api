@@ -129,9 +129,11 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 	model := modelCfg.ID
 	requiredTier := modelCfg.MinTier
 	pool := GetWorkerPool()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	// Capture request-derived values before SendStreamWriter: the fiber
+	// context is invalid once the handler returns and the stream writer
+	// closure actually runs.
+	streamUserIP := c.IP()
+	streamHost := c.Host()
 
 	if stream && len(images) == 0 {
 		c.Set("Content-Type", "text/event-stream")
@@ -140,11 +142,16 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 		c.Set("X-Accel-Buffering", "no")
 
 		return c.SendStreamWriter(func(w *bufio.Writer) {
+			// The handler's ctx is canceled when the handler returns (before
+			// this closure runs), so streaming needs its own live context.
+			streamCtx, streamCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer streamCancel()
+
 			var usedWorker *AccountWorker
 			var streamResp *gemini.GeminiResponse
 			startTime := time.Now()
 
-			streamErr := pool.ExecuteQueuedStreamWithTier(ctx, sessionID, requiredTier, func(worker *AccountWorker) error {
+			streamErr := pool.ExecuteQueuedStreamWithTier(streamCtx, sessionID, requiredTier, func(worker *AccountWorker) error {
 				usedWorker = worker
 				sr, err := worker.Client.AskStreamModel(prompt, model, func(chunk string) {
 					data, _ := json.Marshal(fiber.Map{"text": chunk})
@@ -170,7 +177,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 							filename = fmt.Sprintf("img_%d_%d.png", time.Now().Unix(), i)
 						}
 						if err := DownloadAndClean(usedWorker.Client, imgURL, filename, "image"); err == nil {
-							streamResp.Images[i] = fmt.Sprintf("http://%s/output/%s", c.Host(), filename)
+							streamResp.Images[i] = fmt.Sprintf("http://%s/output/%s", streamHost, filename)
 						}
 					}
 				}
@@ -183,7 +190,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 							filename = fmt.Sprintf("vid_%d_0.mp4", time.Now().Unix())
 						}
 						if err := DownloadAndClean(usedWorker.Client, vidURL, filename, "video"); err == nil {
-							streamResp.Videos[0] = fmt.Sprintf("http://%s/output/%s", c.Host(), filename)
+							streamResp.Videos[0] = fmt.Sprintf("http://%s/output/%s", streamHost, filename)
 						}
 					}
 				}
@@ -194,7 +201,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			w.Flush()
 
-			userIP := c.IP()
+			userIP := streamUserIP
 			elapsed := time.Since(startTime).Seconds()
 			go func() {
 				tier := "free"
@@ -223,6 +230,9 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 	if len(images) > 0 {
 		log.Printf("📸 Image/Media request: %d items, prompt: %s (model: %s, tier: %s)", len(images), prompt, model, requiredTier)
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
 
 	var usedWorker *AccountWorker
 	resp, err := pool.ExecuteQueuedWithTier(ctx, sessionID, requiredTier, func(w *AccountWorker) (*gemini.GeminiResponse, error) {
@@ -386,6 +396,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	}
 
 	pool := GetWorkerPool()
+	streamUserIP := c.IP() // capture before SendStreamWriter: the request ctx is invalid inside the closure
 
 	if req.Stream {
 		c.Set("Content-Type", "text/event-stream")
@@ -394,13 +405,18 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		c.Set("X-Accel-Buffering", "no")
 
 		return c.SendStreamWriter(func(w *bufio.Writer) {
+			// The handler's ctx is canceled when the handler returns (before this
+			// closure runs), so streaming needs its own live context.
+			streamCtx, streamCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer streamCancel()
+
 			chunkID := "chatcmpl-" + uuid.NewString()[:12]
 			createdTime := time.Now().Unix()
 			var usedWorker *AccountWorker
 			var streamResp *gemini.GeminiResponse
 			var accumulatedOutput strings.Builder
 
-			streamErr := pool.ExecuteQueuedStreamWithTier(ctx, sessionID, requiredTier, func(wWorker *AccountWorker) error {
+			streamErr := pool.ExecuteQueuedStreamWithTier(streamCtx, sessionID, requiredTier, func(wWorker *AccountWorker) error {
 				usedWorker = wWorker
 				sr, err := wWorker.Client.AskStreamModel(askPrompt, model, func(chunk string) {
 					if len(req.Tools) > 0 {
@@ -519,7 +535,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			w.Flush()
 
-			userIP := c.IP()
+			userIP := streamUserIP
 			go func() {
 				tier := "free"
 				accID := ""
