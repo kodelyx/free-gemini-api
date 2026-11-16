@@ -418,6 +418,9 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 
 			streamErr := pool.ExecuteQueuedStreamWithTier(streamCtx, sessionID, requiredTier, func(wWorker *AccountWorker) error {
 				usedWorker = wWorker
+				// OpenAI clients send the full history themselves; a fresh upstream
+				// conversation per request avoids bleed-through and poisoned-context loops.
+				wWorker.Client.ResetConversationState()
 				sr, err := wWorker.Client.AskStreamModel(askPrompt, model, func(chunk string) {
 					if len(req.Tools) > 0 {
 						// Buffer chunks when tools are requested to evaluate tool call
@@ -562,6 +565,9 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	var usedWorker *AccountWorker
 	resp, err := pool.ExecuteQueuedWithTier(ctx, sessionID, requiredTier, func(w *AccountWorker) (*gemini.GeminiResponse, error) {
 		usedWorker = w
+		// OpenAI clients send the full history themselves; a fresh upstream
+		// conversation per request avoids bleed-through and poisoned-context loops.
+		w.Client.ResetConversationState()
 		return w.Client.AskModel(askPrompt, model)
 	})
 	if err != nil {

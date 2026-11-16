@@ -498,6 +498,21 @@ func (c *GeminiClient) AskStream(prompt string, onChunk func(text string)) (*Gem
 	return c.AskStreamModel(prompt, "", onChunk)
 }
 
+// ResetConversationState clears the sticky upstream conversation state so the
+// next AskModel/AskStreamModel call starts a fresh Gemini conversation.
+// The OpenAI-compat endpoint needs this: its clients re-send the full message
+// history themselves, and reusing one shared upstream conversation across all
+// local clients causes context bleed-through between sessions and persistent
+// refusal loops once a conversation goes bad.
+func (c *GeminiClient) ResetConversationState() {
+	c.convMu.Lock()
+	defer c.convMu.Unlock()
+	c.convStates = nil
+	c.ConversationID = ""
+	c.ResponseID = ""
+	c.ChoiceID = ""
+}
+
 // AskStreamModel streams with a specific target model
 func (c *GeminiClient) AskStreamModel(prompt string, modelName string, onChunk func(text string)) (*GeminiResponse, error) {
 	start := time.Now()
