@@ -326,10 +326,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	var fullPromptBuilder strings.Builder
 
 	for _, m := range req.Messages {
-		contentStr := ""
-		if m.Content != nil {
-			contentStr = *m.Content
-		}
+		contentStr := FlattenContent(m.Content)
 		if m.Role == "user" {
 			prompt = contentStr
 			fullPromptBuilder.WriteString("User: " + contentStr + "\n")
@@ -350,9 +347,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 
 	if prompt == "" && len(req.Messages) > 0 {
 		lastM := req.Messages[len(req.Messages)-1]
-		if lastM.Content != nil {
-			prompt = *lastM.Content
-		}
+		prompt = FlattenContent(lastM.Content)
 	}
 
 	// Inject Tool Instructions into conversation if tools are provided
@@ -599,7 +594,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		cleanText := arranged.CleanText
 		message = OpenAIChatMessage{
 			Role:    "assistant",
-			Content: &cleanText,
+			Content: contentRawString(cleanText),
 		}
 		if arranged.ReasoningContent != "" {
 			rc := arranged.ReasoningContent
