@@ -106,6 +106,60 @@ var defaultBuiltinModels = []ModelConfig{
 		Source:         "builtin",
 	},
 	{
+		ID:             "gemini-4-hydrogen",
+		DisplayName:    "Google Gemini 4 Hydrogen",
+		Description:    "Everyday help — new-generation default model (repoints the 3.8 Flash everyday slot), 1M context",
+		// Verified via live capture (2026-11-17): the Gemini web app's "Everyday help 4 Hydrogen"
+		// picker entry sends mode hash 56fdd199312815e2 (config key 45676041 = default everyday model).
+		// Hydrogen thinking tiers in the UI: Low / Medium / High (no xhigh).
+		ModeID:         "56fdd199312815e2",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,null,[4,5,6,8,16,19,20],null,null,null,null,null,8,1,null,null,null,null]`,
+		MinTier:        "free",
+		Aliases:        []string{"hydrogen", "4-hydrogen", "gemini-hydrogen", "everyday-help"},
+		Capabilities:   []string{"chat", "stream", "vision", "tools", "long_context"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
+	{
+		ID:             "gemini-4-hydrogen-thinking-medium",
+		DisplayName:    "Google Gemini 4 Hydrogen (Thinking Medium)",
+		Description:    "Everyday help with balanced thinking depth (Medium=4)",
+		ModeID:         "56fdd199312815e2",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,null,[4,5,6,8,16,19,20],null,null,null,null,null,8,%d,null,null,null,null]`,
+		ThinkingLevel:  4,
+		MinTier:        "free",
+		Aliases:        []string{"hydrogen-thinking-medium", "hydrogen-medium"},
+		Capabilities:   []string{"chat", "stream", "thinking", "long_context"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
+	{
+		ID:             "gemini-4-hydrogen-thinking-high",
+		DisplayName:    "Google Gemini 4 Hydrogen (Thinking High)",
+		Description:    "Everyday help with extra thorough thinking depth (High=2)",
+		ModeID:         "56fdd199312815e2",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,null,[4,5,6,8,16,19,20],null,null,null,null,null,8,%d,null,null,null,null]`,
+		ThinkingLevel:  2,
+		MinTier:        "free",
+		Aliases:        []string{"hydrogen-thinking-high", "hydrogen-high"},
+		Capabilities:   []string{"chat", "stream", "thinking", "math", "code", "long_context"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
+	{
+		ID:             "gemini-4-hydrogen-thinking-low",
+		DisplayName:    "Google Gemini 4 Hydrogen (Thinking Low)",
+		Description:    "Everyday help with quick and efficient thinking (Low=1)",
+		ModeID:         "56fdd199312815e2",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,null,[4,5,6,8,16,19,20],null,null,null,null,null,8,%d,null,null,null,null]`,
+		ThinkingLevel:  1,
+		MinTier:        "free",
+		Aliases:        []string{"hydrogen-thinking-low", "hydrogen-low"},
+		Capabilities:   []string{"chat", "stream", "thinking", "long_context"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
+	{
 		ID:             "gemini-3.1-pro",
 		DisplayName:    "Google Gemini 3.1 Pro",
 		Description:    "Advanced reasoning — complex coding and multi-turn problem solving",
@@ -379,6 +433,26 @@ func (r *ModelRegistry) Resolve(name string) *ModelConfig {
 	}
 	if strings.Contains(clean, "lite") {
 		if m, ok := r.models["gemini-3.5-flash-lite"]; ok {
+			return m
+		}
+	}
+	if strings.Contains(clean, "hydrogen") {
+		if strings.Contains(clean, "high") {
+			if m, ok := r.models["gemini-4-hydrogen-thinking-high"]; ok {
+				return m
+			}
+		}
+		if strings.Contains(clean, "med") {
+			if m, ok := r.models["gemini-4-hydrogen-thinking-medium"]; ok {
+				return m
+			}
+		}
+		if strings.Contains(clean, "low") {
+			if m, ok := r.models["gemini-4-hydrogen-thinking-low"]; ok {
+				return m
+			}
+		}
+		if m, ok := r.models["gemini-4-hydrogen"]; ok {
 			return m
 		}
 	}
