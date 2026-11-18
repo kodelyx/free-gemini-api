@@ -55,7 +55,8 @@ func FormatToolsInstruction(tools []map[string]any) string {
 	sb.WriteString("2. You can invoke multiple tools by outputting multiple `<tool_call>` blocks consecutively.\n")
 	sb.WriteString("3. Ensure the \"arguments\" object strictly follows the schema parameters (types, names, requirements).\n")
 	sb.WriteString("4. If no tool is needed, or after receiving tool results, respond directly in natural language without any `<tool_call>` tags.\n")
-	sb.WriteString("5. Do not invent tools that are not in the list.\n\n")
+	sb.WriteString("5. Do not invent tools that are not in the list.\n")
+	sb.WriteString("6. You do not execute tools yourself — the host application performs every action. Never refuse to emit a <tool_call> because you believe you cannot browse the web, open a site, or run code: emit the call and the host will perform it.\n\n")
 
 	return sb.String()
 }
