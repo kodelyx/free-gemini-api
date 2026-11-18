@@ -18,8 +18,6 @@ import (
 	"github.com/google/uuid"
 )
 
-
-
 // EstimateTokens calculates an accurate token count using word and character heuristics
 func EstimateTokens(text string) int {
 	clean := strings.TrimSpace(text)
@@ -42,6 +40,19 @@ func EstimateTokens(text string) int {
 		tokens = 1
 	}
 	return tokens
+}
+
+// firstUserMessageContent returns the flattened text of the conversation's
+// first user message. Clients that send no explicit affinity identifier are
+// scoped per chat by this value, so separate chats get separate upstream
+// conversations while the turns of one chat stay together.
+func firstUserMessageContent(msgs []OpenAIChatMessage) string {
+	for _, m := range msgs {
+		if strings.EqualFold(m.Role, "user") {
+			return strings.TrimSpace(FlattenContent(m.Content))
+		}
+	}
+	return ""
 }
 
 // HandleUnifiedChat handles /chat endpoint (text, images, screen recordings, ref videos)
@@ -361,6 +372,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	}
 
 	// Multi-agent & session affinity resolution
+	explicitSession := true
 	sessionID := strings.TrimSpace(c.Get("X-Agent-ID"))
 	if sessionID == "" {
 		sessionID = strings.TrimSpace(c.Get("X-Session-ID"))
@@ -375,7 +387,20 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		sessionID = strings.TrimSpace(c.Query("session_id"))
 	}
 	if sessionID == "" {
+		explicitSession = false
 		sessionID = c.IP()
+	}
+
+	// Clients that send no affinity identifier (OpenCode / AI-SDK) previously
+	// collapsed every chat behind the same IP into a single shared upstream
+	// conversation, so a bad turn or refusal in one chat leaked into every
+	// other one. Scope the fallback by the conversation's opening user
+	// message, which stays stable across all turns of one chat (harnesses
+	// replay the full transcript each turn) and differs between chats.
+	if !explicitSession {
+		if first := firstUserMessageContent(req.Messages); first != "" {
+			sessionID += "|chat:" + contentScopeKey(first)
+		}
 	}
 
 	// Scope the continuation bookkeeping by system-prompt identity: harnesses
@@ -475,7 +500,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 						}
 						sendPrompt = prompt
 					}
-	
+
 					accumulatedOutput.Reset()
 					sr, err := wWorker.Client.AskStreamModelSession(sendPrompt, model, func(chunk string) {
 						accumulatedOutput.WriteString(chunk)
@@ -805,4 +830,3 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 
 	return c.JSON(openAIResp)
 }
-

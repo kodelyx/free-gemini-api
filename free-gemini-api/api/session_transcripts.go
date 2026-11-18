@@ -89,6 +89,14 @@ func systemScopeKey(systemContent string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// contentScopeKey returns a short stable fingerprint of an arbitrary string.
+// Used to derive a per-conversation scope from the first user message when a
+// client sends no explicit affinity identifier.
+func contentScopeKey(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:8])
+}
+
 // commitSessionTurn records a successful turn so subsequent requests can be
 // sent as deltas continuing the given upstream conversation. The full
 // conversation pointer (conv/resp/choice ids) and the owning worker are kept

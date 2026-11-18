@@ -148,7 +148,6 @@ func TestArrangeGeminiOutput_GenuineMarkdownLinkKept(t *testing.T) {
 	}
 }
 
-
 func TestArrangeGeminiOutput_SandboxCleanup(t *testing.T) {
 	raw := "```python?code_reference&code_event_index=1\nprint(45 * 2)\n```\n\n```text?code_stdout&code_event_index=1\n90\n```\n\n90"
 	res := ArrangeGeminiOutput(raw)
@@ -162,4 +161,3 @@ func TestArrangeGeminiOutput_SandboxCleanup(t *testing.T) {
 		t.Errorf("Expected cleaned ```text fence, got %q", res.CleanText)
 	}
 }
-

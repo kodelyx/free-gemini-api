@@ -127,6 +127,51 @@ func (c *GeminiClient) getAccountPrefix() string {
 	return ""
 }
 
+// optionalConversationID marshals an absent conversation pointer as JSON null
+// rather than an empty string, matching the web client's "start a new chat"
+// payload.
+func optionalConversationID(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// temporaryChatFlagIndex is the position in the request array that marks the
+// chat as temporary. Temporary chats are not saved to the account's history and
+// do not draw on personal context/memory, which is what keeps one client
+// conversation from leaking into another when several harness chats share a
+// Google account.
+const temporaryChatFlagIndex = 45
+
+// buildRequestStruct assembles the outer request array. Only the first three
+// positions are populated (messages, language, conversation metadata) plus the
+// temporary-chat flag; the remaining positions are sparse and left nil.
+func buildRequestStruct(msgInner, msgLang, msgContext any, temporary bool) []interface{} {
+	req := make([]interface{}, temporaryChatFlagIndex+1)
+	req[0] = msgInner
+	req[1] = msgLang
+	req[2] = msgContext
+	if temporary {
+		req[temporaryChatFlagIndex] = 1
+	}
+	return req
+}
+
+// temporaryChatsEnabled reports whether upstream turns should be marked as
+// temporary chats. Temporary chats are not saved to the account's history and
+// do not draw on personal context/memory. This proxy fronts one Google account
+// for many independent harness conversations, so without it a chat in one
+// client can surface in another (Gemini's personal context recalls recent
+// chats). Set GEMINI_TEMPORARY_CHATS=0 to opt out.
+func temporaryChatsEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GEMINI_TEMPORARY_CHATS"))) {
+	case "0", "false", "off", "no":
+		return false
+	}
+	return true
+}
+
 // convStateKey builds the conversation-state map key for a (session, model)
 // pair. An empty sessionKey selects the legacy shared state used by the native
 // endpoints (unified /chat, media, image and video generation).
@@ -236,8 +281,8 @@ func NewClient(cookiesFile string) (*GeminiClient, error) {
 
 	c := &GeminiClient{
 		client:      client,
-		quicClient: quicClient,
-		useQUIC:    false,
+		quicClient:  quicClient,
+		useQUIC:     false,
 		cookiesFile: cookiesFile,
 		ReqID:       rand.Intn(9000000) + 1000000,
 		convStates:  make(map[string]*ModelConversationState),
@@ -266,7 +311,6 @@ func (c *GeminiClient) loadCookies() error {
 		}
 		return err
 	}
-
 
 	// JSON Array Format
 	var cookieList []CookieObject
@@ -506,10 +550,10 @@ func (c *GeminiClient) executeWithRetry(actionName string, runFunc func() error)
 	}
 
 	log.Printf("⚠️ [%s] Request failed: %v. Triggering automatic cookie sync and session refresh...", actionName, err)
-	
+
 	// Reset initialized status to force session re-initialization
 	c.IsInitialized = false
-	
+
 	// InitSession will broadcast cookie refresh, sleep 5s, reload cookies, and retry the app session init
 	if initErr := c.InitSession(); initErr != nil {
 		log.Printf("❌ [%s] Session recovery failed: %v", actionName, initErr)
@@ -608,8 +652,8 @@ func (c *GeminiClient) executeStreamRequestSession(prompt string, modelName stri
 
 	msgInner := []interface{}{prompt, 0, nil, []interface{}{}, nil, nil, 0}
 	msgLang := []string{"en-GB"}
-	msgContext := []interface{}{convID, respID, choiceID, nil, nil, nil, nil, nil, nil, ""}
-	msgStruct := []interface{}{msgInner, msgLang, msgContext}
+	msgContext := []interface{}{optionalConversationID(convID), optionalConversationID(respID), optionalConversationID(choiceID), nil, nil, nil, nil, nil, nil, ""}
+	msgStruct := buildRequestStruct(msgInner, msgLang, msgContext, temporaryChatsEnabled())
 
 	msgJSON, _ := json.Marshal(msgStruct)
 	fReqVal := []interface{}{nil, string(msgJSON)}
@@ -1222,8 +1266,8 @@ func (c *GeminiClient) sendRequestSession(prompt string, tool string, imageRef [
 	}
 	msgInner := []interface{}{prompt, 0, nil, imagesPayload, nil, nil, 0}
 	msgLang := []string{"en-GB"}
-	msgContext := []interface{}{convID, respID, choiceID, nil, nil, nil, nil, nil, nil, ""}
-	msgStruct := []interface{}{msgInner, msgLang, msgContext}
+	msgContext := []interface{}{optionalConversationID(convID), optionalConversationID(respID), optionalConversationID(choiceID), nil, nil, nil, nil, nil, nil, ""}
+	msgStruct := buildRequestStruct(msgInner, msgLang, msgContext, temporaryChatsEnabled())
 
 	if tool != "" {
 		for len(msgStruct) < 33 {
@@ -1459,7 +1503,7 @@ func parseResponse(raw string, res *GeminiResponse) {
 														if imgURL, ok := deepArr[3].(string); ok {
 															base := strings.Split(imgURL, "=")[0]
 															imgURL = base + "=s0"
-															
+
 															// Deduplicate: only append if not already in res.Images
 															isDup := false
 															for _, existing := range res.Images {

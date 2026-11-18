@@ -328,7 +328,6 @@ func balancedJSONObjectAt(s string, start int) (string, bool) {
 	return "", false
 }
 
-
 var (
 	codeFenceWithQueryRegex = regexp.MustCompile(`(?m)^` + "```" + `([a-zA-Z0-9_-]+)\?[^\n]*$`)
 	multiNewlineRegex       = regexp.MustCompile(`\n{3,}`)
