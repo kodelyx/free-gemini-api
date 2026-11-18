@@ -787,6 +787,38 @@ func (c *GeminiClient) doStreamRequestHTTP2(fullURL string, data url.Values, mod
 	return c.readAndProcessStream(resp.Body, onChunk)
 }
 
+// isArtifactStreamText reports whether a streamed snapshot is an opaque
+// googleusercontent artifact handle rather than model prose. Gemini's stream
+// occasionally carries such a URL in the text slot (generated media/UI
+// artifacts); emitting it as chat text corrupts the answer.
+func isArtifactStreamText(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return false
+	}
+	if !strings.HasPrefix(t, "http://googleusercontent.com/") && !strings.HasPrefix(t, "https://googleusercontent.com/") {
+		return false
+	}
+	return !strings.ContainsAny(t, " \t\r\n")
+}
+
+// nextStreamDelta projects a fresh upstream snapshot onto the text already
+// emitted. Gemini's StreamGenerate emits both growing snapshots of the answer
+// and, near the end, full re-renders of it (sometimes repeated); naively
+// appending every snapshot duplicates whole paragraphs. Only a snapshot that
+// genuinely extends what the client already has produces a delta.
+func nextStreamDelta(sent, snapshot string) (delta, newSent string) {
+	if snapshot == "" || snapshot == sent {
+		return "", sent
+	}
+	if strings.HasPrefix(snapshot, sent) {
+		return snapshot[len(sent):], snapshot
+	}
+	// Divergent snapshot: a re-render or duplicate of text already delivered,
+	// not an extension. Emitting it would duplicate content.
+	return "", sent
+}
+
 func (c *GeminiClient) readAndProcessStream(body io.Reader, onChunk func(text string)) (string, error) {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
@@ -794,7 +826,7 @@ func (c *GeminiClient) readAndProcessStream(body io.Reader, onChunk func(text st
 	}
 	rawBody := string(bodyBytes)
 
-	prevText := ""
+	sent := ""
 	lines := strings.Split(rawBody, "\n")
 	for i := 0; i < len(lines); i++ {
 		line := strings.TrimSpace(lines[i])
@@ -805,16 +837,15 @@ func (c *GeminiClient) readAndProcessStream(body io.Reader, onChunk func(text st
 		tempResp := &GeminiResponse{}
 		parseResponse(line, tempResp)
 
-		if tempResp.Text != "" && tempResp.Text != prevText {
-			delta := tempResp.Text
-			if strings.HasPrefix(delta, prevText) {
-				delta = delta[len(prevText):]
-			}
-			if delta != "" && onChunk != nil {
-				onChunk(delta)
-			}
-			prevText = tempResp.Text
+		snapshot := tempResp.Text
+		if snapshot == "" || isArtifactStreamText(snapshot) {
+			continue
 		}
+		delta, newSent := nextStreamDelta(sent, snapshot)
+		if delta != "" && onChunk != nil {
+			onChunk(delta)
+		}
+		sent = newSent
 	}
 
 	return rawBody, nil
