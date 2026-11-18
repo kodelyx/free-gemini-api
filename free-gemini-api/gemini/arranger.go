@@ -64,7 +64,24 @@ var (
 	thoughtRegex  = regexp.MustCompile(`(?s)<(?:thought|thinking)>([\s\S]*?)</(?:thought|thinking)>`)
 	toolCallRegex = regexp.MustCompile(`(?s)<tool_call>([\s\S]*?)</tool_call>`)
 	jsonCodeBlock = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{[\\s\\S]*?\\})\\s*```")
+	// Gemini web auto-linkifies bare URLs in its rendered stream, producing
+	// "[https://x](https://x)" instead of the plain URL. Inside tool-call
+	// arguments that extra markdown syntax corrupts the JSON payload.
+	autoLinkRegex = regexp.MustCompile(`\[(https?://[^\]]+)\]\((https?://[^)]+)\)`)
 )
+
+// deLinkifyAutoLinks rewrites Gemini's auto-linkified anchors back to the bare
+// URL when the label and href are identical (the auto-link artifact shape).
+// A genuine markdown link whose label differs from its href is left intact.
+func deLinkifyAutoLinks(s string) string {
+	return autoLinkRegex.ReplaceAllStringFunc(s, func(m string) string {
+		sub := autoLinkRegex.FindStringSubmatch(m)
+		if len(sub) == 3 && sub[1] == sub[2] {
+			return sub[1]
+		}
+		return m
+	})
+}
 
 // ArrangeGeminiOutput analyzes, cleans, parses, and structures raw Gemini output
 func ArrangeGeminiOutput(raw string) *ArrangedOutput {
@@ -93,6 +110,10 @@ func ArrangeGeminiOutput(raw string) *ArrangedOutput {
 
 	text = strings.TrimSpace(text)
 
+	// Gemini's web stream auto-linkifies bare URLs ("[https://x](https://x)").
+	// Undo that so tool-call arguments keep the plain URL.
+	text = deLinkifyAutoLinks(text)
+
 	// 2. Extract Tool Calls from <tool_call> tags
 	toolCallMatches := toolCallRegex.FindAllStringSubmatch(text, -1)
 	if len(toolCallMatches) > 0 {
@@ -115,7 +136,7 @@ func ArrangeGeminiOutput(raw string) *ArrangedOutput {
 	}
 
 	// 3. Fallback: Check if response contains a direct JSON tool call inside code block or raw JSON
-	if strings.Contains(text, `"name"`) && (strings.Contains(text, `"arguments"`) || strings.Contains(text, `"parameters"`)) {
+	if strings.Contains(text, `"name"`) {
 		// Try code block first
 		if cbMatches := jsonCodeBlock.FindAllStringSubmatch(text, -1); len(cbMatches) > 0 {
 			for _, m := range cbMatches {
@@ -132,6 +153,16 @@ func ArrangeGeminiOutput(raw string) *ArrangedOutput {
 		if len(res.ToolCalls) == 0 {
 			tc, ok := parseSingleToolCall(text)
 			if ok {
+				res.ToolCalls = append(res.ToolCalls, tc)
+			}
+		}
+		// If still none, scan for the first balanced JSON object that parses as
+		// a tool call. Models sometimes emit overlapping/concatenated objects
+		// (e.g. a truncated attempt immediately followed by the full one), and
+		// sometimes put the argument fields at the top level ({"name": "x",
+		// "code": "..."}) instead of nesting them under "arguments".
+		if len(res.ToolCalls) == 0 {
+			if tc, ok := findFirstJSONToolCall(text); ok {
 				res.ToolCalls = append(res.ToolCalls, tc)
 			}
 		}
@@ -156,6 +187,8 @@ func parseSingleToolCall(payload string) (ToolCall, bool) {
 	payload = strings.TrimPrefix(payload, "```")
 	payload = strings.TrimSuffix(payload, "```")
 	payload = strings.TrimSpace(payload)
+	// Undo Gemini's auto-linkified URLs so URL arguments stay intact.
+	payload = deLinkifyAutoLinks(payload)
 
 	var obj map[string]any
 	if err := json.Unmarshal([]byte(payload), &obj); err != nil {
@@ -198,6 +231,26 @@ func parseSingleToolCall(payload string) (ToolCall, bool) {
 		}
 	}
 
+	// Fallback: models sometimes put the argument fields at the top level,
+	// either instead of an "arguments"/"parameters" object
+	// ({"name": "execute", "code": "..."}) or alongside an empty one.
+	// Collect the remaining non-meta keys as the arguments object.
+	if argsStr == "{}" {
+		rest := map[string]any{}
+		for k, v := range obj {
+			switch k {
+			case "name", "tool", "function", "id", "type", "arguments", "parameters":
+				continue
+			}
+			rest[k] = v
+		}
+		if len(rest) > 0 {
+			if bytes, err := json.Marshal(rest); err == nil {
+				argsStr = string(bytes)
+			}
+		}
+	}
+
 	// Ensure argsStr is valid JSON
 	var dummy any
 	if err := json.Unmarshal([]byte(argsStr), &dummy); err != nil {
@@ -213,6 +266,67 @@ func parseSingleToolCall(payload string) (ToolCall, bool) {
 		},
 	}, true
 }
+
+// findFirstJSONToolCall scans text for balanced {...} objects and returns the
+// first that parses as a tool call. Handles overlapping or concatenated JSON
+// emissions (e.g. a truncated attempt immediately followed by the full one).
+func findFirstJSONToolCall(text string) (ToolCall, bool) {
+	candidates := 0
+	for i := 0; i < len(text); i++ {
+		if text[i] != '{' {
+			continue
+		}
+		if candidates >= 50 {
+			break
+		}
+		candidates++
+		objStr, ok := balancedJSONObjectAt(text, i)
+		if !ok {
+			continue
+		}
+		if tc, ok := parseSingleToolCall(objStr); ok {
+			return tc, true
+		}
+	}
+	return ToolCall{}, false
+}
+
+// balancedJSONObjectAt returns the substring starting at s[start] ('{') up to
+// and including its balanced closing '}', honouring JSON string escapes.
+func balancedJSONObjectAt(s string, start int) (string, bool) {
+	depth := 0
+	inStr := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch c {
+			case '\\':
+				escaped = true
+			case '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1], true
+			}
+		}
+	}
+	return "", false
+}
+
 
 var (
 	codeFenceWithQueryRegex = regexp.MustCompile(`(?m)^` + "```" + `([a-zA-Z0-9_-]+)\?[^\n]*$`)
