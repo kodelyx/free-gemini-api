@@ -127,32 +127,112 @@ func (c *GeminiClient) getAccountPrefix() string {
 	return ""
 }
 
+// optionalConversationID marshals an absent conversation pointer as JSON null
+// rather than an empty string, matching the web client's "start a new chat"
+// payload.
+func optionalConversationID(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// temporaryChatFlagIndex is the position in the request array that marks the
+// chat as temporary. Temporary chats are not saved to the account's history and
+// do not draw on personal context/memory, which is what keeps one client
+// conversation from leaking into another when several harness chats share a
+// Google account.
+const temporaryChatFlagIndex = 45
+
+// buildRequestStruct assembles the outer request array. Only the first three
+// positions are populated (messages, language, conversation metadata) plus the
+// temporary-chat flag; the remaining positions are sparse and left nil.
+func buildRequestStruct(msgInner, msgLang, msgContext any, temporary bool) []interface{} {
+	req := make([]interface{}, temporaryChatFlagIndex+1)
+	req[0] = msgInner
+	req[1] = msgLang
+	req[2] = msgContext
+	if temporary {
+		req[temporaryChatFlagIndex] = 1
+	}
+	return req
+}
+
+// temporaryChatsEnabled reports whether upstream turns should be marked as
+// temporary chats. Temporary chats are not saved to the account's history and
+// do not draw on personal context/memory. This proxy fronts one Google account
+// for many independent harness conversations, so without it a chat in one
+// client can surface in another (Gemini's personal context recalls recent
+// chats). Set GEMINI_TEMPORARY_CHATS=0 to opt out.
+func temporaryChatsEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GEMINI_TEMPORARY_CHATS"))) {
+	case "0", "false", "off", "no":
+		return false
+	}
+	return true
+}
+
+// convStateKey builds the conversation-state map key for a (session, model)
+// pair. An empty sessionKey selects the legacy shared state used by the native
+// endpoints (unified /chat, media, image and video generation).
+func convStateKey(sessionKey, modelID string) string {
+	if sessionKey == "" {
+		return modelID
+	}
+	return modelID + "\x00" + sessionKey
+}
+
 func (c *GeminiClient) getConvState(modelID string) (string, string, string) {
+	return c.getConvStateFor("", modelID)
+}
+
+// getConvStateFor reads conversation state for one (session, model) pair.
+// Legacy callers (empty sessionKey) fall back to the client-wide ids so
+// existing media/chat flows keep their behavior; session-scoped callers get a
+// fresh conversation when no state exists yet.
+func (c *GeminiClient) getConvStateFor(sessionKey, modelID string) (string, string, string) {
 	c.convMu.Lock()
 	defer c.convMu.Unlock()
 	if c.convStates == nil {
 		c.convStates = make(map[string]*ModelConversationState)
 	}
-	if state, ok := c.convStates[modelID]; ok && state != nil {
+	if state, ok := c.convStates[convStateKey(sessionKey, modelID)]; ok && state != nil {
 		return state.ConversationID, state.ResponseID, state.ChoiceID
 	}
-	return c.ConversationID, c.ResponseID, c.ChoiceID
+	if sessionKey == "" {
+		return c.ConversationID, c.ResponseID, c.ChoiceID
+	}
+	return "", "", ""
+}
+
+// CurrentConversationIDFor exposes the live upstream conversation id for a
+// (session, model) pair so callers can verify which conversation a session is
+// bound to before appending a delta turn.
+func (c *GeminiClient) CurrentConversationIDFor(sessionKey, modelID string) string {
+	convID, _, _ := c.getConvStateFor(sessionKey, modelID)
+	return convID
 }
 
 func (c *GeminiClient) updateConvState(modelID, convID, respID, choiceID string) {
+	c.updateConvStateFor("", modelID, convID, respID, choiceID)
+}
+
+func (c *GeminiClient) updateConvStateFor(sessionKey, modelID, convID, respID, choiceID string) {
 	c.convMu.Lock()
 	defer c.convMu.Unlock()
 	if c.convStates == nil {
 		c.convStates = make(map[string]*ModelConversationState)
 	}
-	c.convStates[modelID] = &ModelConversationState{
+	c.convStates[convStateKey(sessionKey, modelID)] = &ModelConversationState{
 		ConversationID: convID,
 		ResponseID:     respID,
 		ChoiceID:       choiceID,
 	}
-	c.ConversationID = convID
-	c.ResponseID = respID
-	c.ChoiceID = choiceID
+	if sessionKey == "" {
+		c.ConversationID = convID
+		c.ResponseID = respID
+		c.ChoiceID = choiceID
+	}
 }
 
 type CookieObject struct {
@@ -201,8 +281,8 @@ func NewClient(cookiesFile string) (*GeminiClient, error) {
 
 	c := &GeminiClient{
 		client:      client,
-		quicClient: quicClient,
-		useQUIC:    false,
+		quicClient:  quicClient,
+		useQUIC:     false,
 		cookiesFile: cookiesFile,
 		ReqID:       rand.Intn(9000000) + 1000000,
 		convStates:  make(map[string]*ModelConversationState),
@@ -231,7 +311,6 @@ func (c *GeminiClient) loadCookies() error {
 		}
 		return err
 	}
-
 
 	// JSON Array Format
 	var cookieList []CookieObject
@@ -471,10 +550,10 @@ func (c *GeminiClient) executeWithRetry(actionName string, runFunc func() error)
 	}
 
 	log.Printf("⚠️ [%s] Request failed: %v. Triggering automatic cookie sync and session refresh...", actionName, err)
-	
+
 	// Reset initialized status to force session re-initialization
 	c.IsInitialized = false
-	
+
 	// InitSession will broadcast cookie refresh, sleep 5s, reload cookies, and retry the app session init
 	if initErr := c.InitSession(); initErr != nil {
 		log.Printf("❌ [%s] Session recovery failed: %v", actionName, initErr)
@@ -490,7 +569,7 @@ func (c *GeminiClient) Ask(prompt string) (*GeminiResponse, error) {
 }
 
 func (c *GeminiClient) AskModel(prompt string, modelName string) (*GeminiResponse, error) {
-	return c.AskWithToolModel(prompt, "", modelName)
+	return c.AskWithToolModelSession(prompt, "", modelName, "")
 }
 
 // AskStream sends a prompt and streams text chunks via callback as they arrive
@@ -498,14 +577,51 @@ func (c *GeminiClient) AskStream(prompt string, onChunk func(text string)) (*Gem
 	return c.AskStreamModel(prompt, "", onChunk)
 }
 
+// AskModelSession asks with a session-scoped upstream conversation: state is
+// stored per (sessionKey, model) pair, so distinct client sessions never share
+// one gemini.google.com conversation.
+func (c *GeminiClient) AskModelSession(prompt string, modelName string, sessionKey string) (*GeminiResponse, error) {
+	return c.AskWithToolModelSession(prompt, "", modelName, sessionKey)
+}
+
+// ResetConversationStateSession clears the sticky upstream conversation state
+// for one (session, model) pair so the next Ask*Session call starts a fresh
+// Gemini conversation.
+func (c *GeminiClient) ResetConversationStateSession(sessionKey, modelID string) {
+	c.convMu.Lock()
+	defer c.convMu.Unlock()
+	if c.convStates == nil {
+		return
+	}
+	delete(c.convStates, convStateKey(sessionKey, modelID))
+}
+
+// RestoreConversationStateSession re-installs a known upstream conversation
+// pointer for a (session, model) pair. Used after a pool reload recreates the
+// worker client: the conversation itself still lives on gemini.google.com,
+// only the client-side pointer was lost, so the session can keep appending
+// deltas to it (same Google account).
+func (c *GeminiClient) RestoreConversationStateSession(sessionKey, modelID, convID, respID, choiceID string) {
+	if convID == "" {
+		return
+	}
+	c.updateConvStateFor(sessionKey, modelID, convID, respID, choiceID)
+}
+
 // AskStreamModel streams with a specific target model
 func (c *GeminiClient) AskStreamModel(prompt string, modelName string, onChunk func(text string)) (*GeminiResponse, error) {
+	return c.AskStreamModelSession(prompt, modelName, onChunk, "")
+}
+
+// AskStreamModelSession streams with a session-scoped upstream conversation
+// (see AskModelSession).
+func (c *GeminiClient) AskStreamModelSession(prompt string, modelName string, onChunk func(text string), sessionKey string) (*GeminiResponse, error) {
 	start := time.Now()
-	
+
 	var response *GeminiResponse
 	execErr := c.executeWithRetry("AskStream", func() error {
 		var err error
-		response, err = c.executeStreamRequest(prompt, modelName, onChunk)
+		response, err = c.executeStreamRequestSession(prompt, modelName, onChunk, sessionKey)
 		return err
 	})
 
@@ -519,6 +635,10 @@ func (c *GeminiClient) AskStreamModel(prompt string, modelName string, onChunk f
 
 // executeStreamRequest performs the actual streaming call with HTTP/3 QUIC + HTTP/2 fallback
 func (c *GeminiClient) executeStreamRequest(prompt string, modelName string, onChunk func(text string)) (*GeminiResponse, error) {
+	return c.executeStreamRequestSession(prompt, modelName, onChunk, "")
+}
+
+func (c *GeminiClient) executeStreamRequestSession(prompt string, modelName string, onChunk func(text string), sessionKey string) (*GeminiResponse, error) {
 	if err := c.ensureInit(); err != nil {
 		return nil, err
 	}
@@ -528,12 +648,12 @@ func (c *GeminiClient) executeStreamRequest(prompt string, modelName string, onC
 	c.ReqID += 100
 	reqID := fmt.Sprintf("%d", c.ReqID)
 
-	convID, respID, choiceID := c.getConvState(modelCfg.ID)
+	convID, respID, choiceID := c.getConvStateFor(sessionKey, modelCfg.ID)
 
 	msgInner := []interface{}{prompt, 0, nil, []interface{}{}, nil, nil, 0}
 	msgLang := []string{"en-GB"}
-	msgContext := []interface{}{convID, respID, choiceID, nil, nil, nil, nil, nil, nil, ""}
-	msgStruct := []interface{}{msgInner, msgLang, msgContext}
+	msgContext := []interface{}{optionalConversationID(convID), optionalConversationID(respID), optionalConversationID(choiceID), nil, nil, nil, nil, nil, nil, ""}
+	msgStruct := buildRequestStruct(msgInner, msgLang, msgContext, temporaryChatsEnabled())
 
 	msgJSON, _ := json.Marshal(msgStruct)
 	fReqVal := []interface{}{nil, string(msgJSON)}
@@ -577,7 +697,7 @@ func (c *GeminiClient) executeStreamRequest(prompt string, modelName string, onC
 	parseResponse(rawBody, response)
 
 	if response.ConversationID != "" {
-		c.updateConvState(modelCfg.ID, response.ConversationID, response.ResponseID, response.ChoiceID)
+		c.updateConvStateFor(sessionKey, modelCfg.ID, response.ConversationID, response.ResponseID, response.ChoiceID)
 	}
 
 	// Video auto-detect
@@ -667,6 +787,38 @@ func (c *GeminiClient) doStreamRequestHTTP2(fullURL string, data url.Values, mod
 	return c.readAndProcessStream(resp.Body, onChunk)
 }
 
+// isArtifactStreamText reports whether a streamed snapshot is an opaque
+// googleusercontent artifact handle rather than model prose. Gemini's stream
+// occasionally carries such a URL in the text slot (generated media/UI
+// artifacts); emitting it as chat text corrupts the answer.
+func isArtifactStreamText(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return false
+	}
+	if !strings.HasPrefix(t, "http://googleusercontent.com/") && !strings.HasPrefix(t, "https://googleusercontent.com/") {
+		return false
+	}
+	return !strings.ContainsAny(t, " \t\r\n")
+}
+
+// nextStreamDelta projects a fresh upstream snapshot onto the text already
+// emitted. Gemini's StreamGenerate emits both growing snapshots of the answer
+// and, near the end, full re-renders of it (sometimes repeated); naively
+// appending every snapshot duplicates whole paragraphs. Only a snapshot that
+// genuinely extends what the client already has produces a delta.
+func nextStreamDelta(sent, snapshot string) (delta, newSent string) {
+	if snapshot == "" || snapshot == sent {
+		return "", sent
+	}
+	if strings.HasPrefix(snapshot, sent) {
+		return snapshot[len(sent):], snapshot
+	}
+	// Divergent snapshot: a re-render or duplicate of text already delivered,
+	// not an extension. Emitting it would duplicate content.
+	return "", sent
+}
+
 func (c *GeminiClient) readAndProcessStream(body io.Reader, onChunk func(text string)) (string, error) {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
@@ -674,7 +826,7 @@ func (c *GeminiClient) readAndProcessStream(body io.Reader, onChunk func(text st
 	}
 	rawBody := string(bodyBytes)
 
-	prevText := ""
+	sent := ""
 	lines := strings.Split(rawBody, "\n")
 	for i := 0; i < len(lines); i++ {
 		line := strings.TrimSpace(lines[i])
@@ -685,16 +837,15 @@ func (c *GeminiClient) readAndProcessStream(body io.Reader, onChunk func(text st
 		tempResp := &GeminiResponse{}
 		parseResponse(line, tempResp)
 
-		if tempResp.Text != "" && tempResp.Text != prevText {
-			delta := tempResp.Text
-			if strings.HasPrefix(delta, prevText) {
-				delta = delta[len(prevText):]
-			}
-			if delta != "" && onChunk != nil {
-				onChunk(delta)
-			}
-			prevText = tempResp.Text
+		snapshot := tempResp.Text
+		if snapshot == "" || isArtifactStreamText(snapshot) {
+			continue
 		}
+		delta, newSent := nextStreamDelta(sent, snapshot)
+		if delta != "" && onChunk != nil {
+			onChunk(delta)
+		}
+		sent = newSent
 	}
 
 	return rawBody, nil
@@ -933,7 +1084,15 @@ func (c *GeminiClient) AskWithTool(prompt string, tool string) (*GeminiResponse,
 	return c.AskWithToolModel(prompt, tool, "")
 }
 
+// AskWithToolModel requests with an optional native tool (music_gen etc.) on
+// the legacy shared conversation state.
 func (c *GeminiClient) AskWithToolModel(prompt string, tool string, modelName string) (*GeminiResponse, error) {
+	return c.AskWithToolModelSession(prompt, tool, modelName, "")
+}
+
+// AskWithToolModelSession requests with a session-scoped upstream conversation
+// (see AskModelSession).
+func (c *GeminiClient) AskWithToolModelSession(prompt string, tool string, modelName string, sessionKey string) (*GeminiResponse, error) {
 	start := time.Now()
 	if err := c.ensureInit(); err != nil {
 		return nil, err
@@ -944,7 +1103,7 @@ func (c *GeminiClient) AskWithToolModel(prompt string, tool string, modelName st
 	var response *GeminiResponse
 	var err error
 	execErr := c.executeWithRetry("AskWithTool", func() error {
-		_, response, err = c.sendRequest(prompt, tool, nil, modelCfg)
+		_, response, err = c.sendRequestSession(prompt, tool, nil, modelCfg, sessionKey)
 		if err != nil {
 			return err
 		}
@@ -959,7 +1118,7 @@ func (c *GeminiClient) AskWithToolModel(prompt string, tool string, modelName st
 	}
 
 	if response.ConversationID != "" {
-		c.updateConvState(modelCfg.ID, response.ConversationID, response.ResponseID, response.ChoiceID)
+		c.updateConvStateFor(sessionKey, modelCfg.ID, response.ConversationID, response.ResponseID, response.ChoiceID)
 	}
 
 	// Music fallback: if URL didn't come in first response, quick poll
@@ -1118,13 +1277,19 @@ func (c *GeminiClient) pollConversation(convID string) (string, error) {
 }
 
 func (c *GeminiClient) sendRequest(prompt string, tool string, imageRef []interface{}, modelCfg *ModelConfig) (string, *GeminiResponse, error) {
+	return c.sendRequestSession(prompt, tool, imageRef, modelCfg, "")
+}
+
+// sendRequestSession sends one upstream turn using the conversation state
+// scoped to sessionKey (empty = legacy shared state).
+func (c *GeminiClient) sendRequestSession(prompt string, tool string, imageRef []interface{}, modelCfg *ModelConfig, sessionKey string) (string, *GeminiResponse, error) {
 	if modelCfg == nil {
 		modelCfg = GetModelRegistry().Resolve("")
 	}
 	c.ReqID += 100
 	reqID := fmt.Sprintf("%d", c.ReqID)
 
-	convID, respID, choiceID := c.getConvState(modelCfg.ID)
+	convID, respID, choiceID := c.getConvStateFor(sessionKey, modelCfg.ID)
 
 	imagesPayload := imageRef
 	if imagesPayload == nil {
@@ -1132,8 +1297,8 @@ func (c *GeminiClient) sendRequest(prompt string, tool string, imageRef []interf
 	}
 	msgInner := []interface{}{prompt, 0, nil, imagesPayload, nil, nil, 0}
 	msgLang := []string{"en-GB"}
-	msgContext := []interface{}{convID, respID, choiceID, nil, nil, nil, nil, nil, nil, ""}
-	msgStruct := []interface{}{msgInner, msgLang, msgContext}
+	msgContext := []interface{}{optionalConversationID(convID), optionalConversationID(respID), optionalConversationID(choiceID), nil, nil, nil, nil, nil, nil, ""}
+	msgStruct := buildRequestStruct(msgInner, msgLang, msgContext, temporaryChatsEnabled())
 
 	if tool != "" {
 		for len(msgStruct) < 33 {
@@ -1369,7 +1534,7 @@ func parseResponse(raw string, res *GeminiResponse) {
 														if imgURL, ok := deepArr[3].(string); ok {
 															base := strings.Split(imgURL, "=")[0]
 															imgURL = base + "=s0"
-															
+
 															// Deduplicate: only append if not already in res.Images
 															isDup := false
 															for _, existing := range res.Images {

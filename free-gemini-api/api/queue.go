@@ -486,11 +486,12 @@ func (p *WorkerPool) ExecuteQueuedWithTier(ctx context.Context, affinityKey stri
 		p.ReleaseWorker(worker, opErr)
 
 		if opErr == nil {
-			if resp != nil && resp.ConversationID != "" {
-				p.BindAffinity(resp.ConversationID, worker.ID)
-				if affinityKey != "" {
-					p.BindAffinity(affinityKey, worker.ID)
-				}
+			// Always bind session affinity on success: the worker's client
+			// now holds the session's upstream conversation state (kept per
+			// session+model), so follow-up turns must come back to this
+			// worker to stay on-thread.
+			if affinityKey != "" {
+				p.BindAffinity(affinityKey, worker.ID)
 			}
 			return resp, nil
 		}
@@ -532,11 +533,11 @@ func (p *WorkerPool) ExecuteQueuedStreamWithTier(ctx context.Context, affinityKe
 		return streamErr
 	}
 
-	if worker.Client != nil && worker.Client.ConversationID != "" {
-		p.BindAffinity(worker.Client.ConversationID, worker.ID)
-		if affinityKey != "" {
-			p.BindAffinity(affinityKey, worker.ID)
-		}
+	// Always bind session affinity on success: the worker's client now holds
+	// the session's upstream conversation state (kept per session+model), so
+	// follow-up turns must come back to this worker to stay on-thread.
+	if affinityKey != "" {
+		p.BindAffinity(affinityKey, worker.ID)
 	}
 	return nil
 }

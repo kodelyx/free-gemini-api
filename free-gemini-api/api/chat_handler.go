@@ -18,8 +18,6 @@ import (
 	"github.com/google/uuid"
 )
 
-
-
 // EstimateTokens calculates an accurate token count using word and character heuristics
 func EstimateTokens(text string) int {
 	clean := strings.TrimSpace(text)
@@ -42,6 +40,19 @@ func EstimateTokens(text string) int {
 		tokens = 1
 	}
 	return tokens
+}
+
+// firstUserMessageContent returns the flattened text of the conversation's
+// first user message. Clients that send no explicit affinity identifier are
+// scoped per chat by this value, so separate chats get separate upstream
+// conversations while the turns of one chat stay together.
+func firstUserMessageContent(msgs []OpenAIChatMessage) string {
+	for _, m := range msgs {
+		if strings.EqualFold(m.Role, "user") {
+			return strings.TrimSpace(FlattenContent(m.Content))
+		}
+	}
+	return ""
 }
 
 // HandleUnifiedChat handles /chat endpoint (text, images, screen recordings, ref videos)
@@ -134,9 +145,11 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 	model := modelCfg.ID
 	requiredTier := modelCfg.MinTier
 	pool := GetWorkerPool()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	// Capture request-derived values before SendStreamWriter: the fiber
+	// context is invalid once the handler returns and the stream writer
+	// closure actually runs.
+	streamUserIP := c.IP()
+	streamHost := c.Host()
 
 	if stream && len(images) == 0 {
 		c.Set("Content-Type", "text/event-stream")
@@ -145,11 +158,16 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 		c.Set("X-Accel-Buffering", "no")
 
 		return c.SendStreamWriter(func(w *bufio.Writer) {
+			// The handler's ctx is canceled when the handler returns (before
+			// this closure runs), so streaming needs its own live context.
+			streamCtx, streamCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer streamCancel()
+
 			var usedWorker *AccountWorker
 			var streamResp *gemini.GeminiResponse
 			startTime := time.Now()
 
-			streamErr := pool.ExecuteQueuedStreamWithTier(ctx, sessionID, requiredTier, func(worker *AccountWorker) error {
+			streamErr := pool.ExecuteQueuedStreamWithTier(streamCtx, sessionID, requiredTier, func(worker *AccountWorker) error {
 				usedWorker = worker
 				sr, err := worker.Client.AskStreamModel(prompt, model, func(chunk string) {
 					data, _ := json.Marshal(fiber.Map{"text": chunk})
@@ -175,7 +193,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 							filename = fmt.Sprintf("img_%d_%d.png", time.Now().Unix(), i)
 						}
 						if err := DownloadAndClean(usedWorker.Client, imgURL, filename, "image"); err == nil {
-							streamResp.Images[i] = fmt.Sprintf("http://%s/output/%s", c.Host(), filename)
+							streamResp.Images[i] = fmt.Sprintf("http://%s/output/%s", streamHost, filename)
 						}
 					}
 				}
@@ -188,7 +206,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 							filename = fmt.Sprintf("vid_%d_0.mp4", time.Now().Unix())
 						}
 						if err := DownloadAndClean(usedWorker.Client, vidURL, filename, "video"); err == nil {
-							streamResp.Videos[0] = fmt.Sprintf("http://%s/output/%s", c.Host(), filename)
+							streamResp.Videos[0] = fmt.Sprintf("http://%s/output/%s", streamHost, filename)
 						}
 					}
 				}
@@ -199,7 +217,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			w.Flush()
 
-			userIP := c.IP()
+			userIP := streamUserIP
 			elapsed := time.Since(startTime).Seconds()
 			go func() {
 				tier := "free"
@@ -226,8 +244,11 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 	}
 
 	if len(images) > 0 {
-		log.Printf("📸 Image/Media request: %d items, prompt: %s (model: %s, tier: %s)", len(images), prompt, model, requiredTier)
+		log.Printf("ðŸ“¸ Image/Media request: %d items, prompt: %s (model: %s, tier: %s)", len(images), prompt, model, requiredTier)
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
 
 	var usedWorker *AccountWorker
 	resp, err := pool.ExecuteQueuedWithTier(ctx, sessionID, requiredTier, func(w *AccountWorker) (*gemini.GeminiResponse, error) {
@@ -336,10 +357,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	var fullPromptBuilder strings.Builder
 
 	for _, m := range req.Messages {
-		contentStr := ""
-		if m.Content != nil {
-			contentStr = *m.Content
-		}
+		contentStr := FlattenContent(m.Content)
 		if m.Role == "user" {
 			prompt = contentStr
 			fullPromptBuilder.WriteString("User: " + contentStr + "\n")
@@ -360,18 +378,11 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 
 	if prompt == "" && len(req.Messages) > 0 {
 		lastM := req.Messages[len(req.Messages)-1]
-		if lastM.Content != nil {
-			prompt = *lastM.Content
-		}
-	}
-
-	// Inject Tool Instructions into conversation if tools are provided
-	if len(req.Tools) > 0 {
-		toolInstruction := gemini.FormatToolsInstruction(req.Tools)
-		fullPromptBuilder.WriteString(toolInstruction)
+		prompt = FlattenContent(lastM.Content)
 	}
 
 	// Multi-agent & session affinity resolution
+	explicitSession := true
 	sessionID := strings.TrimSpace(c.Get("X-Agent-ID"))
 	if sessionID == "" {
 		sessionID = strings.TrimSpace(c.Get("X-Session-ID"))
@@ -386,22 +397,57 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		sessionID = strings.TrimSpace(c.Query("session_id"))
 	}
 	if sessionID == "" {
+		explicitSession = false
 		sessionID = c.IP()
+	}
+
+	// Clients that send no affinity identifier (OpenCode / AI-SDK) previously
+	// collapsed every chat behind the same IP into a single shared upstream
+	// conversation, so a bad turn or refusal in one chat leaked into every
+	// other one. Scope the fallback by the conversation's opening user
+	// message, which stays stable across all turns of one chat (harnesses
+	// replay the full transcript each turn) and differs between chats.
+	if !explicitSession {
+		if first := firstUserMessageContent(req.Messages); first != "" {
+			sessionID += "|chat:" + contentScopeKey(first)
+		}
+	}
+
+	// Scope the continuation bookkeeping by system-prompt identity: harnesses
+	// fire auxiliary one-off requests (session titling, summarizers) with a
+	// completely different system prompt through the same client IP, and they
+	// must not reset or pollute the main chat thread's upstream conversation.
+	sessionKey := sessionID
+	for _, m := range req.Messages {
+		if strings.EqualFold(m.Role, "system") {
+			if scope := systemScopeKey(FlattenContent(m.Content)); scope != "" {
+				sessionKey = sessionID + "|" + scope
+			}
+			break
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	askPrompt := prompt
-	if len(req.Messages) > 1 || hasToolResults || len(req.Tools) > 0 {
-		if hasToolResults {
-			fullPromptBuilder.WriteString("Assistant: ")
-		}
-		askPrompt = fullPromptBuilder.String()
+	// The tool-schema block and the trailing "Assistant: " turn cue are both
+	// positional: the cue always sits at the very end (new rows are inserted
+	// before it on later turns), so including either in the continuation
+	// bookkeeping would break prefix matching. msgFlat holds only the message
+	// rows — the stable comparison base — and the cue + schema block are
+	// appended to whatever is actually sent.
+	var tiBlock string
+	if len(req.Tools) > 0 {
+		tiBlock = gemini.FormatToolsInstruction(req.Tools)
 	}
+	turnCue := ""
+	if hasToolResults {
+		turnCue = "Assistant: "
+	}
+	msgFlat := fullPromptBuilder.String()
 
 	pool := GetWorkerPool()
-
+	streamUserIP := c.IP() // capture before SendStreamWriter: the request ctx is invalid inside the closure
 	if req.Stream {
 		c.Set("Content-Type", "text/event-stream")
 		c.Set("Cache-Control", "no-cache")
@@ -409,45 +455,130 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		c.Set("X-Accel-Buffering", "no")
 
 		return c.SendStreamWriter(func(w *bufio.Writer) {
+			// The handler's ctx is canceled when the handler returns (before this
+			// closure runs), so streaming needs its own live context.
+			streamCtx, streamCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer streamCancel()
+
 			chunkID := "chatcmpl-" + uuid.NewString()[:12]
 			createdTime := time.Now().Unix()
 			var usedWorker *AccountWorker
 			var streamResp *gemini.GeminiResponse
 			var accumulatedOutput strings.Builder
 
-			streamErr := pool.ExecuteQueuedStreamWithTier(ctx, sessionID, requiredTier, func(wWorker *AccountWorker) error {
+			streamErr := pool.ExecuteQueuedStreamWithTier(streamCtx, sessionID, requiredTier, func(wWorker *AccountWorker) error {
 				usedWorker = wWorker
-				sr, err := wWorker.Client.AskStreamModel(askPrompt, model, func(chunk string) {
-					if len(req.Tools) > 0 {
-						// Buffer chunks when tools are requested to evaluate tool call
-						accumulatedOutput.WriteString(chunk)
-						return
+				// With tools requested, chunks are buffered (never streamed to
+				// the client until arranged), so a blocked/empty generation can
+				// be retried invisibly on a fresh upstream conversation.
+				maxAttempts := 1
+				if len(req.Tools) > 0 {
+					maxAttempts = 2
+				}
+				forceFull := false
+				for attempt := 0; attempt < maxAttempts; attempt++ {
+					var sendPrompt string
+					if forceFull {
+						// Previous attempt hit a blocked/empty generation: the
+						// upstream conversation is poisoned, so do NOT restore
+						// its pointer or send a delta — replay everything on a
+						// genuinely fresh conversation.
+						wWorker.Client.ResetConversationStateSession(sessionKey, model)
+						sendPrompt = msgFlat + turnCue + tiBlock
+					} else {
+						// Continuation strategy: continue the session's live upstream
+						// conversation with just the new transcript delta, or reset and
+						// replay the full transcript when that is not safe.
+						curConv := wWorker.Client.CurrentConversationIDFor(sessionKey, model)
+						prompt, needReset := planSessionTurn(sessionKey, curConv, msgFlat)
+						if needReset {
+							// The worker may have been recreated by a cookie re-sync
+							// (pool reload), dropping client-side conversation state
+							// while the upstream conversation still exists. Restore
+							// the recorded pointer when this worker owns it.
+							if conv, respID, choiceID, lastWorker, valid := peekSessionTurnConv(sessionKey); valid && conv != "" && lastWorker == wWorker.ID && curConv == "" {
+								wWorker.Client.RestoreConversationStateSession(sessionKey, model, conv, respID, choiceID)
+								prompt, needReset = planSessionTurn(sessionKey, conv, msgFlat)
+							}
+						}
+						if needReset {
+							// Full replay: message transcript, turn cue, tool schemas.
+							wWorker.Client.ResetConversationStateSession(sessionKey, model)
+							prompt = msgFlat + turnCue + tiBlock
+						} else {
+							prompt += turnCue
+						}
+						sendPrompt = prompt
 					}
-					chunkResp := OpenAIChatCompletionChunk{
-						ID:      chunkID,
-						Object:  "chat.completion.chunk",
-						Created: createdTime,
-						Model:   model,
-						Choices: []OpenAIStreamChoice{
-							{
-								Index: 0,
-								Delta: OpenAIDelta{
-									Content: chunk,
+
+					accumulatedOutput.Reset()
+					sr, err := wWorker.Client.AskStreamModelSession(sendPrompt, model, func(chunk string) {
+						accumulatedOutput.WriteString(chunk)
+						if len(req.Tools) > 0 {
+							// Buffer chunks when tools are requested to evaluate tool call
+							return
+						}
+						chunkResp := OpenAIChatCompletionChunk{
+							ID:      chunkID,
+							Object:  "chat.completion.chunk",
+							Created: createdTime,
+							Model:   model,
+							Choices: []OpenAIStreamChoice{
+								{
+									Index: 0,
+									Delta: OpenAIDelta{
+										Content: chunk,
+									},
 								},
 							},
-						},
+						}
+						data, _ := json.Marshal(chunkResp)
+						fmt.Fprintf(w, "data: %s\n\n", data)
+						w.Flush()
+					}, sessionKey)
+					streamResp = sr
+					if err != nil {
+						return err
 					}
-					data, _ := json.Marshal(chunkResp)
-					fmt.Fprintf(w, "data: %s\n\n", data)
-					w.Flush()
-				})
-				streamResp = sr
-				return err
+					// Retry once on a blocked/empty generation: the poisoned
+					// upstream conversation is reset and the full transcript
+					// (with tool schemas) is replayed fresh.
+					finalAttemptText := accumulatedOutput.String()
+					if streamResp != nil && len(streamResp.Text) > len(finalAttemptText) {
+						finalAttemptText = streamResp.Text
+					}
+					if attempt+1 < maxAttempts && isUnusableModelOutput(finalAttemptText) {
+						log.Printf("⚠️ Unusable model output (%d chars), retrying on a fresh upstream conversation", len(finalAttemptText))
+						invalidateSessionTurn(sessionKey)
+						forceFull = true
+						continue
+					}
+					return nil
+				}
+				return nil
 			})
 
 			if streamErr != nil {
-				log.Printf("❌ Streaming error: %v", streamErr)
+				log.Printf("âŒ Streaming error: %v", streamErr)
+				invalidateSessionTurn(sessionKey)
 				return
+			}
+
+			// Commit the turn only if the model produced usable output; a
+			// blocked/empty generation invalidates the session conversation so
+			// the next request resets it and replays the full transcript.
+			finalText := accumulatedOutput.String()
+			if streamResp != nil && len(streamResp.Text) > len(finalText) {
+				finalText = streamResp.Text
+			}
+			if isUnusableModelOutput(finalText) {
+				invalidateSessionTurn(sessionKey)
+			} else if streamResp != nil {
+				lastWorkerID := ""
+				if usedWorker != nil {
+					lastWorkerID = usedWorker.ID
+				}
+				commitSessionTurn(sessionKey, msgFlat, streamResp.ConversationID, streamResp.ResponseID, streamResp.ChoiceID, lastWorkerID)
 			}
 
 			// If tools were provided, arrange and emit the structured result
@@ -534,7 +665,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			w.Flush()
 
-			userIP := c.IP()
+			userIP := streamUserIP
 			go func() {
 				tier := "free"
 				accID := ""
@@ -561,7 +692,48 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	var usedWorker *AccountWorker
 	resp, err := pool.ExecuteQueuedWithTier(ctx, sessionID, requiredTier, func(w *AccountWorker) (*gemini.GeminiResponse, error) {
 		usedWorker = w
-		return w.Client.AskModel(askPrompt, model)
+		// Nothing has been emitted yet, so a blocked/empty generation can be
+		// retried invisibly on a fresh upstream conversation.
+		forceFull := false
+		for attempt := 0; attempt < 2; attempt++ {
+			var sendPrompt string
+			if forceFull {
+				// Poisoned conversation: replay everything fresh.
+				w.Client.ResetConversationStateSession(sessionKey, model)
+				sendPrompt = msgFlat + turnCue + tiBlock
+			} else {
+				curConv := w.Client.CurrentConversationIDFor(sessionKey, model)
+				prompt, needReset := planSessionTurn(sessionKey, curConv, msgFlat)
+				if needReset {
+					// Restore the recorded upstream conversation pointer after a
+					// pool reload recreated this worker (see stream path).
+					if conv, respID, choiceID, lastWorker, valid := peekSessionTurnConv(sessionKey); valid && conv != "" && lastWorker == w.ID && curConv == "" {
+						w.Client.RestoreConversationStateSession(sessionKey, model, conv, respID, choiceID)
+						prompt, needReset = planSessionTurn(sessionKey, conv, msgFlat)
+					}
+				}
+				if needReset {
+					// Full replay: message transcript, turn cue, tool schemas.
+					w.Client.ResetConversationStateSession(sessionKey, model)
+					prompt = msgFlat + turnCue + tiBlock
+				} else {
+					prompt += turnCue
+				}
+				sendPrompt = prompt
+			}
+			r, err := w.Client.AskModelSession(sendPrompt, model, sessionKey)
+			if err != nil {
+				return nil, err
+			}
+			if attempt+1 < 2 && isUnusableModelOutput(r.Text) {
+				log.Printf("⚠️ Unusable model output (%d chars), retrying on a fresh upstream conversation", len(r.Text))
+				invalidateSessionTurn(sessionKey)
+				forceFull = true
+				continue
+			}
+			return r, nil
+		}
+		return nil, fmt.Errorf("unreachable")
 	})
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -577,6 +749,19 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 			})
 		}
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Commit the turn only if the model produced usable output; a blocked or
+	// empty generation invalidates the session conversation so the next
+	// request resets it and replays the full transcript.
+	if isUnusableModelOutput(resp.Text) {
+		invalidateSessionTurn(sessionKey)
+	} else {
+		lastWorkerID := ""
+		if usedWorker != nil {
+			lastWorkerID = usedWorker.ID
+		}
+		commitSessionTurn(sessionKey, msgFlat, resp.ConversationID, resp.ResponseID, resp.ChoiceID, lastWorkerID)
 	}
 
 	arranged := gemini.ArrangeGeminiOutput(resp.Text)
@@ -609,7 +794,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		cleanText := arranged.CleanText
 		message = OpenAIChatMessage{
 			Role:    "assistant",
-			Content: &cleanText,
+			Content: contentRawString(cleanText),
 		}
 		if arranged.ReasoningContent != "" {
 			rc := arranged.ReasoningContent
