@@ -44,7 +44,7 @@ Google has officially categorized its next-generation Gemini 4 lineup with speci
 | **📋 Native Agentic Task Mode** | Supports Google's new Task mode (`[40]`) for multi-step project planning and autonomous workflows alongside standard Chat (`[0]`). |
 | **🔌 Drop-In OpenAI Standard** | Connects seamlessly with **Cursor**, **Cline**, **NextChat**, **OpenWebUI**, **LangChain**, and official OpenAI Python & TypeScript SDKs. |
 | **🛡️ Distributed Account Pooling** | Connect 1 to 100+ accounts with automatic least-busy load-balancing, tier segregation (Free / Pro / Ultra), and cooldown protection. |
-| **🍪 Zero-Touch Cookie Bridge** | Companion Chrome extension syncs session credentials with zero tab manipulation — over a token-authenticated, loopback-by-default bridge. |
+| **🍪 Zero-Touch Cookie Bridge** | Companion Chrome extension extracts cookies directly from browser memory and syncs via local WebSocket (`ws://127.0.0.1:9226`) with 0 open tabs. |
 | **⚡ Pure Go HTTP/3 QUIC** | Native TLS 1.3 fingerprint simulation (Chrome 152 JA4) with 0-RTT session resumption for minimal round-trip latency. |
 | **📊 Dual Intelligence Analytics** | Real-time SQLite WAL accounting tracking tokens, latency, and estimated cost savings with direct JSON & Excel (`.xlsx`) export. |
 
@@ -92,16 +92,13 @@ The server listens on:
 
 ---
 
-### 2. Connect Your Account (One-Time Pairing)
+### 2. Connect Your Account (Zero-Touch)
 
 1. Open `chrome://extensions/` in Chrome.
 2. Toggle **Developer mode** on (top-right).
 3. Click **Load unpacked** and select the [`gemini-extension/`](./gemini-extension) folder.
-4. Copy the bridge token printed by `./goapi` at startup (also saved in `cookies/.bridge_token`).
-5. Click the extension icon, paste the token into **Bridge token**, and click **Save Connection**.
-6. Log into [gemini.google.com](https://gemini.google.com). The extension securely streams your worker credentials to the local API pool and displays **Paired**.
-
-> **Note**: The bridge token protects your session cookies by ensuring only your authorized local server can receive authentication credentials from the browser.
+4. Log into [gemini.google.com](https://gemini.google.com).
+5. The extension detects your active session and streams the worker credentials to the local API pool automatically!
 
 ---
 
@@ -282,19 +279,9 @@ curl -X POST http://localhost:8001/v1/chat/completions \
 
 ## 🔒 Security & Privacy
 
-The companion extension ships **Google session cookies** to enable local API calls. To safeguard your account, the bridge is authenticated and strictly isolated:
-
-- **Token-Authenticated Bridge (required)**: Both cookie-ingest paths (`ws://127.0.0.1:9226` and `POST /api/sync-cookies`) require a shared secret. The server generates one on first run, stores it in `cookies/.bridge_token` (mode `600`), and prints it once at startup: paste it into the extension popup. No token, no cookies accepted.
-- **No LAN Sweep in the Extension**: The extension only talks to `127.0.0.1` / `localhost` (or a host you explicitly configure). It never scans your local network or probes unknown IPs.
-- **Origin-Checked WebSocket**: The bridge rejects WebSocket handshakes from non-loopback web origins, preventing malicious websites from probing your local bridge.
-- **Verified Server Identity**: Before transmitting cookies, the extension sends a cryptographic nonce and requires an HMAC-SHA256 proof of the bridge token (`/health?nonce=…`).
-- **Minimal Host Permissions**: The extension only requests loopback host permissions plus Google domains.
-- **Locked Down `/health`**: Pool internals (account count, cookie TTL, worker count) are only returned to callers that present the bridge token.
-- **Local Binds**: `BRIDGE_BIND=127.0.0.1` keeps the bridge off the network entirely.
 - **Zero Hardcoded Secrets**: Credentials and cookies are stored strictly in local memory and local files; nothing is sent to external third parties.
+- **Local Network Isolation**: All WebSocket discovery and cookie sync happen strictly over localhost or your local private LAN.
 - **Safe Version Control**: Pre-configured `.gitignore` prevents private Google session tokens and cookies from ever being committed to git.
-
-> ⚠️ This project drives Google's web interface with an authenticated session. Doing so may violate Google's Terms of Service and can get an account rate-limited or restricted. Use your own accounts, and only on a machine and network you control.
 
 ---
 

@@ -11,7 +11,6 @@ goapi
 # Private session cookies (never commit active Google credentials)
 cookies/*.json
 !cookies/.gitkeep
-cookies/.bridge_token
 
 # SQLite database
 data/*.db
