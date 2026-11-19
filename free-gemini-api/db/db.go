@@ -508,3 +508,48 @@ func GetUSDToINRRate() float64 {
 	}
 	return rate
 }
+
+// AccountWindowUsage holds rolling-window request & token consumption for an account
+type AccountWindowUsage struct {
+	FastUsed1h    int `json:"fast_used_1h"`
+	DeepUsed3h    int `json:"deep_used_3h"`
+	TotalUsed24h  int `json:"total_used_24h"`
+	TokensUsed24h int `json:"tokens_used_24h"`
+}
+
+// GetPerAccountWindowUsage computes rolling 1h (fast), 3h (deep/pro/neon/argon), and 24h usage per account_id
+func GetPerAccountWindowUsage() map[string]AccountWindowUsage {
+	out := make(map[string]AccountWindowUsage)
+	if DB == nil {
+		return out
+	}
+
+	rows, err := DB.Query(`
+		SELECT
+			COALESCE(account_id, ''),
+			SUM(CASE WHEN role = 'assistant' AND created_at >= datetime('now', '-1 hour')
+				AND NOT (LOWER(COALESCE(model, '')) LIKE '%pro%' OR LOWER(COALESCE(model, '')) LIKE '%neon%' OR LOWER(COALESCE(model, '')) LIKE '%argon%' OR LOWER(COALESCE(model, '')) LIKE '%carbon%' OR LOWER(COALESCE(model, '')) LIKE '%thinking%')
+				THEN 1 ELSE 0 END) AS fast_1h,
+			SUM(CASE WHEN role = 'assistant' AND created_at >= datetime('now', '-3 hours')
+				AND (LOWER(COALESCE(model, '')) LIKE '%pro%' OR LOWER(COALESCE(model, '')) LIKE '%neon%' OR LOWER(COALESCE(model, '')) LIKE '%argon%' OR LOWER(COALESCE(model, '')) LIKE '%carbon%' OR LOWER(COALESCE(model, '')) LIKE '%thinking%')
+				THEN 1 ELSE 0 END) AS deep_3h,
+			SUM(CASE WHEN role = 'assistant' AND created_at >= datetime('now', '-24 hours') THEN 1 ELSE 0 END) AS total_24h,
+			COALESCE(SUM(CASE WHEN created_at >= datetime('now', '-24 hours') THEN tokens ELSE 0 END), 0) AS tokens_24h
+		FROM messages
+		WHERE created_at >= datetime('now', '-24 hours') AND COALESCE(account_id, '') != ''
+		GROUP BY account_id
+	`)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var accID string
+		var u AccountWindowUsage
+		if err := rows.Scan(&accID, &u.FastUsed1h, &u.DeepUsed3h, &u.TotalUsed24h, &u.TokensUsed24h); err == nil && accID != "" {
+			out[accID] = u
+		}
+	}
+	return out
+}

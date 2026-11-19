@@ -33,6 +33,12 @@ func RegisterRoutes(app *fiber.App) {
 	app.Get("/api/pool", func(c fiber.Ctx) error {
 		return c.JSON(GetWorkerPool().GetStats())
 	})
+	app.Get("/v1/quota", func(c fiber.Ctx) error {
+		return c.JSON(GetWorkerPool().GetQuotaReport())
+	})
+	app.Get("/quota", func(c fiber.Ctx) error {
+		return c.JSON(GetWorkerPool().GetQuotaReport())
+	})
 
 	// Direct HTTP Cookie Sync endpoint (dual resilience fallback for Chrome Extension)
 	app.Post("/api/sync-cookies", func(c fiber.Ctx) error {

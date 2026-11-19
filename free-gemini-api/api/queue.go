@@ -610,6 +610,7 @@ type WorkerPoolStats struct {
 
 type WorkerStats struct {
 	ID                    string `json:"id"`
+	Role                  string `json:"role"`
 	CookiePath            string `json:"cookie_path"`
 	Status                string `json:"status"`
 	Tier                  string `json:"tier"`
@@ -618,6 +619,16 @@ type WorkerStats struct {
 	TotalErrors           int64  `json:"total_errors"`
 	CooldownSecsRemaining int    `json:"cooldown_seconds_remaining"`
 	LastUsed              string `json:"last_used"`
+}
+
+func workerRoleLabel(accountID string) string {
+	if accountID == "guest" {
+		return "guest_fallback"
+	}
+	if isReservedAccount(accountID) {
+		return "reserved_leader"
+	}
+	return "frontline_worker"
 }
 
 // GetStats returns real-time snapshot of the worker pool
@@ -645,7 +656,7 @@ func (p *WorkerPool) GetStats() WorkerPoolStats {
 			stats.ActiveWorkers++
 		}
 
-		if w.Tier == "subscription" {
+		if w.Tier == "subscription" || w.Tier == "ultra" {
 			stats.SubscriptionWorkers++
 		} else {
 			stats.FreeWorkers++
@@ -653,6 +664,7 @@ func (p *WorkerPool) GetStats() WorkerPoolStats {
 
 		ws := WorkerStats{
 			ID:                    w.ID,
+			Role:                  workerRoleLabel(w.ID),
 			CookiePath:            w.CookiePath,
 			Status:                w.Status,
 			Tier:                  w.Tier,
@@ -667,6 +679,158 @@ func (p *WorkerPool) GetStats() WorkerPoolStats {
 	}
 
 	return stats
+}
+
+// QuotaBucket represents used and remaining request capacity within a rolling window
+type QuotaBucket struct {
+	Window       string  `json:"window"`
+	Limit        int     `json:"limit"`
+	Used         int     `json:"used"`
+	Remaining    int     `json:"remaining"`
+	RemainingPct float64 `json:"remaining_pct"`
+}
+
+// AccountQuotaReport provides comprehensive quota & health planning metrics per account
+type AccountQuotaReport struct {
+	AccountID             string      `json:"account_id"`
+	Role                  string      `json:"role"`
+	Tier                  string      `json:"tier"`
+	Status                string      `json:"status"`
+	CooldownSecsRemaining int         `json:"cooldown_seconds_remaining"`
+	CookieTTLFormatted    string      `json:"cookie_ttl_formatted"`
+	FastModels1h          QuotaBucket `json:"fast_models_1h"`
+	DeepModels3h          QuotaBucket `json:"deep_models_3h"`
+	DailyTotal24h         QuotaBucket `json:"daily_total_24h"`
+	TokensUsed24h         int         `json:"tokens_used_24h"`
+	SessionServed         int64       `json:"session_served"`
+	SessionErrors         int64       `json:"session_errors"`
+}
+
+func makeQuotaBucket(window string, limit, used int, inCooldown bool) QuotaBucket {
+	rem := limit - used
+	if rem < 0 || inCooldown {
+		rem = 0
+	}
+	pct := 0.0
+	if limit > 0 {
+		pct = float64(rem) * 100.0 / float64(limit)
+	}
+	return QuotaBucket{
+		Window:       window,
+		Limit:        limit,
+		Used:         used,
+		Remaining:    rem,
+		RemainingPct: pct,
+	}
+}
+
+// GetQuotaReport calculates remaining rolling-window quota across all accounts in the pool
+func (p *WorkerPool) GetQuotaReport() map[string]any {
+	usageMap := db.GetPerAccountWindowUsage()
+	cookieHealthList := gemini.InspectPerAccountCookieHealth()
+	ttlMap := make(map[string]string, len(cookieHealthList))
+	for _, ch := range cookieHealthList {
+		ttlMap[ch.AccountID] = ch.MinTTLFormatted
+	}
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	const (
+		fastLimit1h   = 150 // Fast models (Hydrogen / 3.8 Flash / Auto) per 1h rolling window
+		deepLimit3h   = 40  // Deep/Reasoning models (Neon / Argon / Pro / Thinking) per 3h rolling window
+		dailyLimit24h = 500 // Safe daily total per account per 24h rolling window
+	)
+
+	accounts := make([]AccountQuotaReport, 0, len(p.workers))
+	totalFastRem := 0
+	totalFastLim := 0
+	totalDeepRem := 0
+	totalDeepLim := 0
+	totalDailyRem := 0
+	totalDailyLim := 0
+	totalTokens24h := 0
+
+	for _, w := range p.workers {
+		w.mu.Lock()
+		cooldownRemaining := 0
+		if !w.CooldownUntil.IsZero() && time.Now().Before(w.CooldownUntil) {
+			cooldownRemaining = int(time.Until(w.CooldownUntil).Seconds())
+		}
+		inCooldown := cooldownRemaining > 0 || w.Status == "cooldown"
+		status := w.Status
+		if inCooldown {
+			status = "cooldown"
+		}
+		tier := w.Tier
+		served := atomic.LoadInt64(&w.TotalServed)
+		errs := atomic.LoadInt64(&w.TotalErrors)
+		w.mu.Unlock()
+
+		u := usageMap[w.ID]
+		// If in-memory session served exceeds DB 24h count (e.g. fresh DB), reflect at least session served
+		if int(served) > u.TotalUsed24h {
+			u.TotalUsed24h = int(served)
+		}
+
+		fLim := fastLimit1h
+		dLim := deepLimit3h
+		dayLim := dailyLimit24h
+		if w.ID == "guest" {
+			fLim = 30
+			dLim = 0
+			dayLim = 60
+		}
+
+		fastB := makeQuotaBucket("1h_rolling", fLim, u.FastUsed1h, inCooldown)
+		deepB := makeQuotaBucket("3h_rolling", dLim, u.DeepUsed3h, inCooldown)
+		dailyB := makeQuotaBucket("24h_rolling", dayLim, u.TotalUsed24h, inCooldown)
+
+		if w.ID != "guest" {
+			totalFastRem += fastB.Remaining
+			totalFastLim += fastB.Limit
+			totalDeepRem += deepB.Remaining
+			totalDeepLim += deepB.Limit
+			totalDailyRem += dailyB.Remaining
+			totalDailyLim += dailyB.Limit
+		}
+		totalTokens24h += u.TokensUsed24h
+
+		ttl := ttlMap[w.ID]
+		if ttl == "" {
+			if w.ID == "guest" {
+				ttl = "stateless"
+			} else {
+				ttl = "healthy"
+			}
+		}
+
+		accounts = append(accounts, AccountQuotaReport{
+			AccountID:             w.ID,
+			Role:                  workerRoleLabel(w.ID),
+			Tier:                  tier,
+			Status:                status,
+			CooldownSecsRemaining: cooldownRemaining,
+			CookieTTLFormatted:    ttl,
+			FastModels1h:          fastB,
+			DeepModels3h:          deepB,
+			DailyTotal24h:         dailyB,
+			TokensUsed24h:         u.TokensUsed24h,
+			SessionServed:         served,
+			SessionErrors:         errs,
+		})
+	}
+
+	return map[string]any{
+		"timestamp": time.Now().Format(time.RFC3339),
+		"pool_summary": map[string]any{
+			"fast_models_1h_remaining":  fmt.Sprintf("%d / %d", totalFastRem, totalFastLim),
+			"deep_models_3h_remaining":  fmt.Sprintf("%d / %d", totalDeepRem, totalDeepLim),
+			"daily_total_24h_remaining": fmt.Sprintf("%d / %d", totalDailyRem, totalDailyLim),
+			"tokens_used_24h":           totalTokens24h,
+		},
+		"accounts": accounts,
+	}
 }
 
 // DiscoverModelsFromWorkers triggers autonomous model and tier discovery on all connected accounts
