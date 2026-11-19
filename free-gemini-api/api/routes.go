@@ -3,10 +3,32 @@ package api
 import (
 	"goapi/db"
 	"goapi/gemini"
+	"log"
 	"strconv"
+	"strings"
 
 	"github.com/gofiber/fiber/v3"
 )
+
+// bridgeAuthorized reports whether a request may read cookie-pool internals or
+// write into the pool (issue #1). The shared secret is accepted in the
+// X-Bridge-Token header, as an Authorization: Bearer value, or as ?token= for
+// clients that cannot set headers.
+func bridgeAuthorized(c fiber.Ctx) bool {
+	if gemini.BridgeTokenDisabled() {
+		return true
+	}
+	token := strings.TrimSpace(c.Get(gemini.BridgeTokenHeader))
+	if token == "" {
+		if auth := strings.TrimSpace(c.Get("Authorization")); len(auth) > 7 && strings.EqualFold(auth[:7], "bearer ") {
+			token = strings.TrimSpace(auth[7:])
+		}
+	}
+	if token == "" {
+		token = strings.TrimSpace(c.Query(gemini.BridgeTokenQuery))
+	}
+	return gemini.BridgeTokenMatches(token)
+}
 
 // RegisterRoutes registers all HTTP API routes onto the Fiber app instance
 func RegisterRoutes(app *fiber.App) {
@@ -15,15 +37,36 @@ func RegisterRoutes(app *fiber.App) {
 	app.Get("/help", HandleHelp)
 
 	// Health check endpoint
+	//
+	// Unauthenticated callers get reachability only. The pool internals below
+	// used to be world-readable, which is what made "find any host answering
+	// {"status":"online"} on :8001/health" a useful attack: it fingerprinted a
+	// cookie farm and confirmed the port was live before harvesting from it.
+	// Clients that present the bridge secret (or an operator who disabled the
+	// gate) still get the full payload.
 	app.Get("/health", func(c fiber.Ctx) error {
-		cookieHealth := gemini.InspectAccountCookieHealth()
-		return c.JSON(fiber.Map{
-			"status":                   "online",
-			"engine":                   "arranger + free-gemini-api (pure go)",
-			"cookie_health":            cookieHealth,
-			"active_extension_workers": gemini.GetActiveWorkerCount(),
-			"cookie_accounts_in_pool":  gemini.GetActiveAccountCount(),
-		})
+		resp := fiber.Map{
+			"status": "online",
+			"engine": "arranger + free-gemini-api (pure go)",
+		}
+
+		// Challenge-response identity check: a client that has not yet decided to
+		// trust this host can ask it to prove it holds the bridge secret without
+		// disclosing that secret to the host. See gemini.BridgeProof.
+		if nonce := strings.TrimSpace(c.Query("nonce")); gemini.ValidBridgeNonce(nonce) {
+			resp["bridge_proof"] = gemini.BridgeProof(nonce)
+		}
+
+		if !bridgeAuthorized(c) {
+			resp["bridge_auth"] = "required"
+			return c.JSON(resp)
+		}
+		resp["bridge_auth"] = "ok"
+		resp["bridge_token_fingerprint"] = gemini.BridgeTokenFingerprint()
+		resp["cookie_health"] = gemini.InspectAccountCookieHealth()
+		resp["active_extension_workers"] = gemini.GetActiveWorkerCount()
+		resp["cookie_accounts_in_pool"] = gemini.GetActiveAccountCount()
+		return c.JSON(resp)
 	})
 
 	// Live Worker Pool Metrics & Multi-Account concurrency stats
@@ -35,7 +78,19 @@ func RegisterRoutes(app *fiber.App) {
 	})
 
 	// Direct HTTP Cookie Sync endpoint (dual resilience fallback for Chrome Extension)
+	//
+	// Requires the bridge shared secret (issue #1): this endpoint writes Google
+	// session cookies straight into the worker pool from any host that can
+	// reach the port, so unauthenticated access here is a full account takeover
+	// primitive, not just an information leak.
 	app.Post("/api/sync-cookies", func(c fiber.Ctx) error {
+		if !bridgeAuthorized(c) {
+			log.Printf("🚫 Rejected unauthenticated POST /api/sync-cookies from %s", c.IP())
+			return c.Status(401).JSON(fiber.Map{
+				"error": "unauthorized — send the cookie bridge token in the " + gemini.BridgeTokenHeader + " header",
+			})
+		}
+
 		type SyncPayload struct {
 			Cookies []gemini.CookieObject `json:"cookies"`
 			// ProfileID is the farm profile this jar belongs to. chrome-manage

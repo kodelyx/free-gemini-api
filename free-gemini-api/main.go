@@ -93,6 +93,11 @@ func main() {
 	}
 
 	// Start Chrome Extension WebSocket bridge & Multi-Account Worker Pool
+	//
+	// The bridge secret is resolved here so the pairing token is printed before
+	// the bridge starts accepting clients (issue #1: cookie ingest used to be
+	// completely unauthenticated).
+	gemini.InitBridgeToken()
 	api.StartWebSocketBridge()
 	gemini.StartCookieWatchdog()
 	api.InitWorkerPool()

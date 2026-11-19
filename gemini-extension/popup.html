@@ -12,6 +12,7 @@
       --text-muted: #a0aec0;
       --success: #10b981;
       --danger: #ef4444;
+      --warn: #f59e0b;
     }
 
     body {
@@ -22,13 +23,12 @@
       margin: 0;
       padding: 16px;
       box-sizing: border-box;
-      overflow: hidden;
     }
 
     .container {
       display: flex;
       flex-direction: column;
-      gap: 16px;
+      gap: 14px;
     }
 
     .header {
@@ -54,7 +54,7 @@
       -webkit-text-fill-color: transparent;
     }
 
-    .status-card {
+    .status-card, .config-card {
       background: var(--card);
       border: 1px solid rgba(255, 255, 255, 0.08);
       border-radius: 12px;
@@ -69,11 +69,13 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 8px;
     }
 
     .status-label {
       color: var(--text-muted);
       font-size: 13px;
+      white-space: nowrap;
     }
 
     .status-value {
@@ -82,6 +84,8 @@
       display: flex;
       align-items: center;
       gap: 6px;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .badge {
@@ -89,6 +93,7 @@
       width: 8px;
       height: 8px;
       border-radius: 50%;
+      flex: 0 0 auto;
     }
 
     .badge.connected {
@@ -101,16 +106,56 @@
       box-shadow: 0 0 8px var(--danger);
     }
 
-    .btn-sync {
-      background: linear-gradient(90deg, var(--primary) 0%, var(--secondary) 100%);
-      color: #ffffff;
+    label.field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 11px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    input[type="text"], input[type="password"] {
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 8px 10px;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    input[type="text"]:focus, input[type="password"]:focus {
+      outline: none;
+      border-color: var(--primary);
+    }
+
+    .checkbox-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.35;
+    }
+
+    .btn {
       border: none;
       border-radius: 8px;
       padding: 10px 16px;
       font-weight: 600;
-      font-size: 14px;
+      font-size: 13px;
       cursor: pointer;
       transition: all 0.2s ease;
+    }
+
+    .btn-sync {
+      background: linear-gradient(90deg, var(--primary) 0%, var(--secondary) 100%);
+      color: #ffffff;
+      font-size: 14px;
       box-shadow: 0 4px 15px rgba(142, 45, 226, 0.3);
     }
 
@@ -119,7 +164,7 @@
       box-shadow: 0 6px 20px rgba(142, 45, 226, 0.55);
     }
 
-    .btn-sync:active {
+    .btn-sync:active, .btn-copy:active {
       transform: translateY(1px);
     }
 
@@ -133,16 +178,10 @@
       background: rgba(255, 255, 255, 0.08);
       color: var(--text);
       border: 1px solid rgba(255, 255, 255, 0.15);
-      border-radius: 8px;
-      padding: 10px 16px;
-      font-weight: 600;
-      font-size: 13px;
-      cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
       gap: 8px;
-      transition: all 0.2s ease;
       backdrop-filter: blur(10px);
     }
 
@@ -152,20 +191,31 @@
       transform: translateY(-1px);
     }
 
-    .btn-copy:active {
-      transform: translateY(1px);
-    }
-
     .btn-copy.success {
       background: rgba(16, 185, 129, 0.2);
       border-color: var(--success);
       color: #34d399;
     }
 
+    .notice {
+      font-size: 11px;
+      line-height: 1.4;
+      color: #fca5a5;
+      background: rgba(239, 68, 68, 0.12);
+      border: 1px solid rgba(239, 68, 68, 0.35);
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
+
+    .notice.hidden {
+      display: none;
+    }
+
     .footer {
       text-align: center;
       font-size: 11px;
       color: var(--text-muted);
+      line-height: 1.4;
     }
   </style>
 </head>
@@ -185,16 +235,43 @@
         </span>
       </div>
       <div class="status-row">
+        <span class="status-label">Target</span>
+        <span class="status-value" id="server-host" style="color: var(--text-muted); font-family: ui-monospace, monospace;">—</span>
+      </div>
+      <div class="status-row">
         <span class="status-label">Last Sync</span>
         <span class="status-value" id="last-sync" style="color: var(--text-muted);">Never</span>
       </div>
     </div>
 
-    <div class="button-group">
-      <button class="btn-sync" id="sync-btn">Force Sync Cookies</button>
-      <button class="btn-copy" id="copy-btn">📋 Copy Cookies</button>
+    <div class="config-card">
+      <label class="field">
+        Server host (loopback or a host you own)
+        <input type="text" id="host-input" placeholder="127.0.0.1" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field">
+        Bridge token (printed by your server at startup)
+        <input type="password" id="token-input" placeholder="not configured" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="remote-check">
+        <span>Allow a non-local host. Only tick this for a server you control — cookies are sent to whatever answers at that host.</span>
+      </label>
+      <button class="btn btn-copy" id="save-btn">💾 Save Connection</button>
     </div>
 
+    <div class="notice hidden" id="notice"></div>
+
+    <div class="button-group">
+      <button class="btn btn-sync" id="sync-btn">Force Sync Cookies</button>
+      <button class="btn btn-copy" id="copy-btn">📋 Copy Cookies</button>
+    </div>
+
+    <div class="footer">
+      This extension transmits full Google session cookies to the server above.
+      Anyone who obtains them can hijack the signed-in account — keep the token
+      private and only pair it with a server you run yourself.
+    </div>
   </div>
   <script src="popup.js"></script>
 </body>
