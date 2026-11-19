@@ -101,8 +101,21 @@ func ExecuteWithFailover(sessionID string, op func(client *gemini.GeminiClient) 
 	return GetWorkerPool().ExecuteQueued(ctx, sessionID, op)
 }
 
+var (
+	lastPoolReload time.Time
+	reloadMu       sync.Mutex
+)
+
 func StartWebSocketBridge() {
 	gemini.OnCookiesUpdated = func() {
+		reloadMu.Lock()
+		if time.Since(lastPoolReload) < 15*time.Minute {
+			reloadMu.Unlock()
+			return
+		}
+		lastPoolReload = time.Now()
+		reloadMu.Unlock()
+
 		log.Println("♻️  Extension pushed new cookies. Reloading active sessions across all workers...")
 		UserSessions.Range(func(key, value interface{}) bool {
 			client := value.(*gemini.GeminiClient)

@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -248,8 +249,29 @@ func GetActiveAccountCount() int {
 // Measured 2026-09-27: 54 -> 55 workers after a single refresh.
 //
 // The Chrome extension has no profile id and keeps the old behaviour by passing nil.
+// IsIgnoredAccount returns true if accountID is listed in GEMINI_IGNORE_ACCOUNTS (comma-separated).
+func IsIgnoredAccount(accountID string) bool {
+	if accountID == "" {
+		return false
+	}
+	raw := strings.TrimSpace(os.Getenv("GEMINI_IGNORE_ACCOUNTS"))
+	if raw == "" {
+		return false
+	}
+	for _, part := range strings.Split(raw, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), accountID) {
+			return true
+		}
+	}
+	return false
+}
+
 func ProcessAndSaveCookies(cookies []CookieObject, profileID *int) (string, string, error) {
 	accountID := getAccountIDFromCookies(cookies)
+	if IsIgnoredAccount(accountID) {
+		log.Printf("🛡️ [CookieBridge] Ignoring excluded account [%s] (GEMINI_IGNORE_ACCOUNTS)", accountID)
+		return "", "", nil
+	}
 	if profileID != nil && *profileID > 0 {
 		accountID = fmt.Sprintf("profile_%d", *profileID)
 	}
@@ -267,10 +289,19 @@ func ProcessAndSaveCookies(cookies []CookieObject, profileID *int) (string, stri
 	os.MkdirAll("cookies", 0755)
 
 	accountFilePath := filepath.Join("cookies", fmt.Sprintf("account_%s.json", accountID))
-	if err := os.WriteFile(accountFilePath, data, 0644); err != nil {
-		return "", "", fmt.Errorf("failed to save %s: %w", accountFilePath, err)
+	changed := true
+	if existingData, err := os.ReadFile(accountFilePath); err == nil {
+		if bytes.Equal(existingData, data) {
+			changed = false
+		}
 	}
-	log.Printf("💾 Stored account profile: %s", accountFilePath)
+
+	if changed {
+		if err := os.WriteFile(accountFilePath, data, 0644); err != nil {
+			return "", "", fmt.Errorf("failed to save %s: %w", accountFilePath, err)
+		}
+		log.Printf("💾 Stored updated account profile: %s", accountFilePath)
+	}
 
 	// Refresh CachedImageCookies
 	var parts []string
@@ -279,8 +310,8 @@ func ProcessAndSaveCookies(cookies []CookieObject, profileID *int) (string, stri
 	}
 	CachedImageCookies = strings.Join(parts, "; ")
 
-	// Trigger callback to reload active sessions
-	if OnCookiesUpdated != nil {
+	// Trigger callback to reload active sessions ONLY when cookies actually changed
+	if changed && OnCookiesUpdated != nil {
 		OnCookiesUpdated()
 	}
 

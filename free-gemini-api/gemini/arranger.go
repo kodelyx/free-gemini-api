@@ -31,7 +31,15 @@ type ArrangedOutput struct {
 
 // FormatToolsInstruction creates a clear, structured system prompt injecting tools into Gemini
 func FormatToolsInstruction(tools []map[string]any) string {
+	return FormatToolsInstructionWithChoice(tools, nil)
+}
+
+// FormatToolsInstructionWithChoice formats tool definitions with tool_choice enforcement ("none", "auto", "required", or specific function)
+func FormatToolsInstructionWithChoice(tools []map[string]any, toolChoice interface{}) string {
 	if len(tools) == 0 {
+		return ""
+	}
+	if s, ok := toolChoice.(string); ok && strings.EqualFold(strings.TrimSpace(s), "none") {
 		return ""
 	}
 
@@ -55,9 +63,33 @@ func FormatToolsInstruction(tools []map[string]any) string {
 	sb.WriteString("2. You can invoke multiple tools by outputting multiple `<tool_call>` blocks consecutively.\n")
 	sb.WriteString("3. Ensure the \"arguments\" object strictly follows the schema parameters (types, names, requirements).\n")
 	sb.WriteString("4. If no tool is needed, or after receiving tool results, respond directly in natural language without any `<tool_call>` tags.\n")
-	sb.WriteString("5. Do not invent tools that are not in the list.\n\n")
+	sb.WriteString("5. Do not invent tools that are not in the list.\n")
+
+	if choiceNote := formatToolChoiceConstraint(toolChoice); choiceNote != "" {
+		sb.WriteString("6. " + choiceNote + "\n")
+	}
+	sb.WriteString("\n")
 
 	return sb.String()
+}
+
+func formatToolChoiceConstraint(toolChoice interface{}) string {
+	switch v := toolChoice.(type) {
+	case string:
+		if strings.EqualFold(strings.TrimSpace(v), "required") {
+			return "CRITICAL: You MUST call at least one tool from the list above. Do not respond with plain text alone."
+		}
+	case map[string]any:
+		if fnMap, ok := v["function"].(map[string]any); ok {
+			if name, ok := fnMap["name"].(string); ok && strings.TrimSpace(name) != "" {
+				return "CRITICAL: You MUST call the exact tool named \"" + strings.TrimSpace(name) + "\"."
+			}
+		}
+		if name, ok := v["name"].(string); ok && strings.TrimSpace(name) != "" {
+			return "CRITICAL: You MUST call the exact tool named \"" + strings.TrimSpace(name) + "\"."
+		}
+	}
+	return ""
 }
 
 var (
@@ -66,15 +98,8 @@ var (
 	jsonCodeBlock = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{[\\s\\S]*?\\})\\s*```")
 )
 
-// ArrangeGeminiOutput analyzes, cleans, parses, and structures raw Gemini output
-func ArrangeGeminiOutput(raw string) *ArrangedOutput {
-	res := &ArrangedOutput{
-		FinishReason: "stop",
-	}
-
+func extractThoughtBlocks(raw string) (reasoning string, cleanedText string) {
 	text := raw
-
-	// 1. Extract and separate Thinking / Reasoning blocks (<thought> or <thinking>)
 	if matches := thoughtRegex.FindAllStringSubmatch(text, -1); len(matches) > 0 {
 		var thoughts []string
 		for _, m := range matches {
@@ -86,12 +111,62 @@ func ArrangeGeminiOutput(raw string) *ArrangedOutput {
 			}
 		}
 		if len(thoughts) > 0 {
-			res.ReasoningContent = strings.Join(thoughts, "\n\n")
+			reasoning = strings.Join(thoughts, "\n\n")
 		}
 		text = thoughtRegex.ReplaceAllString(text, "")
 	}
+	return reasoning, strings.TrimSpace(text)
+}
 
-	text = strings.TrimSpace(text)
+// ArrangeGeminiOutputTextOnly cleans raw Gemini output without parsing tool calls (used when no tools are active)
+func ArrangeGeminiOutputTextOnly(raw string) *ArrangedOutput {
+	reasoning, text := extractThoughtBlocks(raw)
+	return &ArrangedOutput{
+		CleanText:        sanitizeGeminiContent(text),
+		ReasoningContent: reasoning,
+		FinishReason:     "stop",
+	}
+}
+
+// ArrangeGeminiOutputWithAllowedTools parses Gemini output and filters tool calls against allowedTools, falling back to text if none remain
+func ArrangeGeminiOutputWithAllowedTools(raw string, allowedTools map[string]bool) *ArrangedOutput {
+	res := ArrangeGeminiOutput(raw)
+	if !res.IsToolCall || len(allowedTools) == 0 {
+		return res
+	}
+
+	var valid []ToolCall
+	for _, tc := range res.ToolCalls {
+		if allowedTools[tc.Function.Name] {
+			valid = append(valid, tc)
+		}
+	}
+
+	if len(valid) > 0 {
+		res.ToolCalls = valid
+		return res
+	}
+
+	// No valid tool calls remain: fall back to clean text output
+	res.ToolCalls = nil
+	res.IsToolCall = false
+	res.FinishReason = "stop"
+	if res.CleanText == "" {
+		_, textWithoutThoughts := extractThoughtBlocks(raw)
+		res.CleanText = sanitizeGeminiContent(textWithoutThoughts)
+	}
+	return res
+}
+
+// ArrangeGeminiOutput analyzes, cleans, parses, and structures raw Gemini output
+func ArrangeGeminiOutput(raw string) *ArrangedOutput {
+	res := &ArrangedOutput{
+		FinishReason: "stop",
+	}
+
+	// 1. Extract and separate Thinking / Reasoning blocks (<thought> or <thinking>)
+	reasoning, text := extractThoughtBlocks(raw)
+	res.ReasoningContent = reasoning
 
 	// 2. Extract Tool Calls from <tool_call> tags
 	toolCallMatches := toolCallRegex.FindAllStringSubmatch(text, -1)

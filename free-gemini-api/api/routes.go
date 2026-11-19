@@ -135,6 +135,9 @@ func RegisterRoutes(app *fiber.App) {
 	// OpenAI-compatible chat completions (with Native Tool Calling & Output Arranger)
 	app.Post("/v1/chat/completions", HandleOpenAIChatCompletions)
 
+	// OpenAI Responses API (/v1/responses) for Codex CLI and agentic clients
+	app.Post("/v1/responses", HandleOpenAIResponses)
+
 	// Unified chat endpoint (text, images, screen recordings, ref videos)
 	app.Post("/chat", HandleUnifiedChat)
 

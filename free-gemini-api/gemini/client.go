@@ -46,6 +46,7 @@ var chromeHeaderOrder = []string{
 	"x-goog-ext-525001261-jspb",
 	"x-goog-ext-525005358-jspb",
 	"x-goog-ext-73010989-jspb",
+	"x-goog-ext-73010990-jspb",
 	"priority",
 }
 
@@ -103,8 +104,74 @@ type GeminiClient struct {
 	SessionSavedAt int64
 	AccountTier    string // "free" or "subscription"
 	AccountPrefix  string // e.g. "/u/4"
+	SessionUUID    string // per-client tab UUIDv4 for x-goog-ext-525005358-jspb
 	convStates     map[string]*ModelConversationState
 	convMu         sync.Mutex
+}
+
+func generateTabUUIDv4() string {
+	var b [16]byte
+	for i := range b {
+		b[i] = byte(rand.Intn(256))
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // Variant 10
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func (c *GeminiClient) getSessionUUID() string {
+	c.convMu.Lock()
+	defer c.convMu.Unlock()
+	if c.SessionUUID == "" {
+		c.SessionUUID = generateTabUUIDv4()
+	}
+	return c.SessionUUID
+}
+
+func (c *GeminiClient) getLiveCookieHeader() string {
+	if c.client != nil && c.client.GetCookieJar() != nil {
+		if uGemini, err := url.Parse("https://gemini.google.com"); err == nil {
+			cookies := c.client.GetCookieJar().Cookies(uGemini)
+			var parts []string
+			for _, ck := range cookies {
+				if ck != nil && ck.Name != "" && ck.Value != "" {
+					parts = append(parts, fmt.Sprintf("%s=%s", ck.Name, ck.Value))
+				}
+			}
+			if len(parts) > 0 {
+				return strings.Join(parts, "; ")
+			}
+		}
+	}
+	return c.RawCookies
+}
+
+func (c *GeminiClient) buildMsgStruct(prompt string, tool string, imagesPayload []interface{}, convID string, respID string, choiceID string) []interface{} {
+	if imagesPayload == nil {
+		imagesPayload = []interface{}{}
+	}
+	msgInner := []interface{}{prompt, 0, nil, imagesPayload, nil, nil, 0}
+	msgLang := []string{"en-GB"}
+	msgContext := []interface{}{convID, respID, choiceID, nil, nil, nil, nil, nil, nil, ""}
+	msgStruct := []interface{}{msgInner, msgLang, msgContext}
+
+	if tool != "" {
+		for len(msgStruct) < 33 {
+			msgStruct = append(msgStruct, nil)
+		}
+		msgStruct = append(msgStruct, []string{tool})
+		return msgStruct
+	}
+
+	if os.Getenv("GEMINI_KEEP_WEB_HISTORY") != "1" {
+		for len(msgStruct) < 60 {
+			msgStruct = append(msgStruct, nil)
+		}
+		msgStruct[45] = 1
+		msgStruct[59] = c.getSessionUUID()
+	}
+
+	return msgStruct
 }
 
 func (c *GeminiClient) getAccountPrefix() string {
@@ -195,16 +262,17 @@ func NewClient(cookiesFile string) (*GeminiClient, error) {
 		},
 	}
 	quicClient := &stdhttp.Client{
-		Timeout:   10 * time.Second,
+		Timeout:   180 * time.Second,
 		Transport: quicTransport,
 	}
 
 	c := &GeminiClient{
 		client:      client,
-		quicClient: quicClient,
-		useQUIC:    false,
+		quicClient:  quicClient,
+		useQUIC:     false,
 		cookiesFile: cookiesFile,
-		ReqID:       rand.Intn(9000000) + 1000000,
+		ReqID:       rand.Intn(800000) + 100000,
+		SessionUUID: generateTabUUIDv4(),
 		convStates:  make(map[string]*ModelConversationState),
 		AccountTier: "free",
 	}
@@ -525,15 +593,12 @@ func (c *GeminiClient) executeStreamRequest(prompt string, modelName string, onC
 
 	modelCfg := GetModelRegistry().Resolve(modelName)
 
-	c.ReqID += 100
+	c.ReqID += 100000
 	reqID := fmt.Sprintf("%d", c.ReqID)
 
 	convID, respID, choiceID := c.getConvState(modelCfg.ID)
 
-	msgInner := []interface{}{prompt, 0, nil, []interface{}{}, nil, nil, 0}
-	msgLang := []string{"en-GB"}
-	msgContext := []interface{}{convID, respID, choiceID, nil, nil, nil, nil, nil, nil, ""}
-	msgStruct := []interface{}{msgInner, msgLang, msgContext}
+	msgStruct := c.buildMsgStruct(prompt, "", nil, convID, respID, choiceID)
 
 	msgJSON, _ := json.Marshal(msgStruct)
 	fReqVal := []interface{}{nil, string(msgJSON)}
@@ -550,6 +615,8 @@ func (c *GeminiClient) executeStreamRequest(prompt string, modelName string, onC
 	query.Add("bl", c.BL)
 	query.Add("_reqid", reqID)
 	query.Add("rt", "c")
+	query.Add("hl", "en")
+	query.Add("source-path", "/app")
 	if c.FSID != "" {
 		query.Add("f.sid", c.FSID)
 	}
@@ -574,7 +641,11 @@ func (c *GeminiClient) executeStreamRequest(prompt string, modelName string, onC
 	}
 
 	response := &GeminiResponse{}
-	parseResponse(rawBody, response)
+	rpcErrCode := parseResponseWithError(rawBody, response)
+
+	if response.Text == "" && rpcErrCode > 0 {
+		return nil, mapGoogleRPCError(rpcErrCode)
+	}
 
 	if response.ConversationID != "" {
 		c.updateConvState(modelCfg.ID, response.ConversationID, response.ResponseID, response.ChoiceID)
@@ -603,18 +674,28 @@ func (c *GeminiClient) doStreamRequestQUIC(fullURL string, data url.Values, mode
 		modelCfg = GetModelRegistry().Resolve("")
 	}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
 	req.Header.Set("User-Agent", CurrentChromeUA)
+	req.Header.Set("sec-ch-ua", CurrentSecChUa)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", CurrentPlatform)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9,th;q=0.8")
 	req.Header.Set("Origin", "https://gemini.google.com")
 	req.Header.Set("Referer", fmt.Sprintf("https://gemini.google.com%s/app", c.getAccountPrefix()))
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Priority", "u=1, i")
 	req.Header.Set("X-Same-Domain", "1")
 	jspbVal := modelCfg.BuildHeaderValue()
 	log.Printf("📡 [Request] model=%s jspb=%s", modelCfg.ID, jspbVal)
 	req.Header.Set("x-goog-ext-525001261-jspb", jspbVal)
-	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
+	req.Header.Set("x-goog-ext-525005358-jspb", fmt.Sprintf(`["%s",1]`, c.getSessionUUID()))
 	req.Header.Set("x-goog-ext-73010989-jspb", modelCfg.BuildModeHeaderValue())
-	if c.RawCookies != "" {
-		req.Header.Set("Cookie", c.RawCookies)
+	req.Header.Set("x-goog-ext-73010990-jspb", `[0]`)
+	if cookieHeader := c.getLiveCookieHeader(); cookieHeader != "" {
+		req.Header.Set("Cookie", cookieHeader)
 	}
 
 	resp, err := c.quicClient.Do(req)
@@ -643,16 +724,26 @@ func (c *GeminiClient) doStreamRequestHTTP2(fullURL string, data url.Values, mod
 	req.Header[http.HeaderOrderKey] = chromeHeaderOrder
 	req.Header[http.PHeaderOrderKey] = chromePseudoHeaderOrder
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
 	req.Header.Set("User-Agent", CurrentChromeUA)
+	req.Header.Set("sec-ch-ua", CurrentSecChUa)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", CurrentPlatform)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9,th;q=0.8")
 	req.Header.Set("Origin", "https://gemini.google.com")
 	req.Header.Set("Referer", fmt.Sprintf("https://gemini.google.com%s/app", c.getAccountPrefix()))
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Priority", "u=1, i")
 	req.Header.Set("X-Same-Domain", "1")
 	jspbVal2 := modelCfg.BuildHeaderValue()
 	log.Printf("📡 [HTTP2-Request] model=%s jspb=%s", modelCfg.ID, jspbVal2)
 	req.Header.Set("x-goog-ext-525001261-jspb", jspbVal2)
-	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
+	req.Header.Set("x-goog-ext-525005358-jspb", fmt.Sprintf(`["%s",1]`, c.getSessionUUID()))
 	req.Header.Set("x-goog-ext-73010989-jspb", modelCfg.BuildModeHeaderValue())
+	req.Header.Set("x-goog-ext-73010990-jspb", `[0]`)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -667,6 +758,19 @@ func (c *GeminiClient) doStreamRequestHTTP2(fullURL string, data url.Values, mod
 	return c.readAndProcessStream(resp.Body, onChunk)
 }
 
+
+var (
+	lmdxRegex     = regexp.MustCompile(`https?://googleusercontent\.com/lmdx_content/[a-zA-Z0-9_\-]+`)
+	followUpRegex = regexp.MustCompile(`(?s)<FollowUp>[\s\S]*?</FollowUp>`)
+)
+
+func SanitizeGeminiText(text string) string {
+	cleaned := lmdxRegex.ReplaceAllString(text, "")
+	cleaned = followUpRegex.ReplaceAllString(cleaned, "")
+	cleaned = strings.ReplaceAll(cleaned, "\x00", "")
+	return strings.TrimSpace(cleaned)
+}
+
 func (c *GeminiClient) readAndProcessStream(body io.Reader, onChunk func(text string)) (string, error) {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
@@ -674,26 +778,17 @@ func (c *GeminiClient) readAndProcessStream(body io.Reader, onChunk func(text st
 	}
 	rawBody := string(bodyBytes)
 
-	prevText := ""
-	lines := strings.Split(rawBody, "\n")
-	for i := 0; i < len(lines); i++ {
-		line := strings.TrimSpace(lines[i])
-		if !strings.HasPrefix(line, "[[\"wrb.fr\"") {
-			continue
-		}
+	finalResp := &GeminiResponse{}
+	parseResponse(rawBody, finalResp)
 
-		tempResp := &GeminiResponse{}
-		parseResponse(line, tempResp)
-
-		if tempResp.Text != "" && tempResp.Text != prevText {
-			delta := tempResp.Text
-			if strings.HasPrefix(delta, prevText) {
-				delta = delta[len(prevText):]
+	cleanText := SanitizeGeminiText(finalResp.Text)
+	if cleanText != "" && onChunk != nil {
+		// Emit clean stream chunks smoothly (word by word)
+		words := strings.SplitAfter(cleanText, " ")
+		for _, w := range words {
+			if w != "" {
+				onChunk(w)
 			}
-			if delta != "" && onChunk != nil {
-				onChunk(delta)
-			}
-			prevText = tempResp.Text
 		}
 	}
 
@@ -1063,7 +1158,7 @@ func (c *GeminiClient) AskVideo(prompt string) (*GeminiResponse, error) {
 
 // CallRPC sends a batchexecute request for any given RPC ID
 func (c *GeminiClient) CallRPC(rpcID, payload string) (string, error) {
-	c.ReqID += 100
+	c.ReqID += 100000
 	reqID := fmt.Sprintf("%d", c.ReqID)
 
 	wrapperJSON, _ := json.Marshal([][][]interface{}{{{rpcID, payload, nil, "generic"}}})
@@ -1121,26 +1216,12 @@ func (c *GeminiClient) sendRequest(prompt string, tool string, imageRef []interf
 	if modelCfg == nil {
 		modelCfg = GetModelRegistry().Resolve("")
 	}
-	c.ReqID += 100
+	c.ReqID += 100000
 	reqID := fmt.Sprintf("%d", c.ReqID)
 
 	convID, respID, choiceID := c.getConvState(modelCfg.ID)
 
-	imagesPayload := imageRef
-	if imagesPayload == nil {
-		imagesPayload = []interface{}{}
-	}
-	msgInner := []interface{}{prompt, 0, nil, imagesPayload, nil, nil, 0}
-	msgLang := []string{"en-GB"}
-	msgContext := []interface{}{convID, respID, choiceID, nil, nil, nil, nil, nil, nil, ""}
-	msgStruct := []interface{}{msgInner, msgLang, msgContext}
-
-	if tool != "" {
-		for len(msgStruct) < 33 {
-			msgStruct = append(msgStruct, nil)
-		}
-		msgStruct = append(msgStruct, []string{tool})
-	}
+	msgStruct := c.buildMsgStruct(prompt, tool, imageRef, convID, respID, choiceID)
 
 	msgJSON, _ := json.Marshal(msgStruct)
 	fReqVal := []interface{}{nil, string(msgJSON)}
@@ -1157,6 +1238,8 @@ func (c *GeminiClient) sendRequest(prompt string, tool string, imageRef []interf
 	query.Add("bl", c.BL)
 	query.Add("_reqid", reqID)
 	query.Add("rt", "c")
+	query.Add("hl", "en")
+	query.Add("source-path", "/app")
 	if c.FSID != "" {
 		query.Add("f.sid", c.FSID)
 	}
@@ -1183,7 +1266,10 @@ func (c *GeminiClient) sendRequest(prompt string, tool string, imageRef []interf
 	log.Printf("Raw Body Length: %d, Response: %s", len(rawBody), rawBody[:min(len(rawBody), 500)])
 
 	response := &GeminiResponse{}
-	parseResponse(rawBody, response)
+	rpcErrCode := parseResponseWithError(rawBody, response)
+	if response.Text == "" && rpcErrCode > 0 {
+		return rawBody, response, mapGoogleRPCError(rpcErrCode)
+	}
 
 	// Direct regex scan for music download URLs in raw body
 	if strings.Contains(rawBody, "contribution.usercontent.google.com") {
@@ -1230,18 +1316,28 @@ func (c *GeminiClient) sendRequestQUIC(fullURL string, data url.Values, modelCfg
 		modelCfg = GetModelRegistry().Resolve("")
 	}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
 	req.Header.Set("User-Agent", CurrentChromeUA)
+	req.Header.Set("sec-ch-ua", CurrentSecChUa)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", CurrentPlatform)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9,th;q=0.8")
 	req.Header.Set("Origin", "https://gemini.google.com")
 	req.Header.Set("Referer", fmt.Sprintf("https://gemini.google.com%s/app", c.getAccountPrefix()))
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Priority", "u=1, i")
 	req.Header.Set("X-Same-Domain", "1")
 	jspbVal := modelCfg.BuildHeaderValue()
 	log.Printf("📡 [sendRequestQUIC] model=%s jspb=%s", modelCfg.ID, jspbVal)
 	req.Header.Set("x-goog-ext-525001261-jspb", jspbVal)
-	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
+	req.Header.Set("x-goog-ext-525005358-jspb", fmt.Sprintf(`["%s",1]`, c.getSessionUUID()))
 	req.Header.Set("x-goog-ext-73010989-jspb", modelCfg.BuildModeHeaderValue())
-	if c.RawCookies != "" {
-		req.Header.Set("Cookie", c.RawCookies)
+	req.Header.Set("x-goog-ext-73010990-jspb", `[0]`)
+	if cookieHeader := c.getLiveCookieHeader(); cookieHeader != "" {
+		req.Header.Set("Cookie", cookieHeader)
 	}
 
 	resp, err := c.quicClient.Do(req)
@@ -1274,16 +1370,26 @@ func (c *GeminiClient) sendRequestHTTP2(fullURL string, data url.Values, modelCf
 	req.Header[http.HeaderOrderKey] = chromeHeaderOrder
 	req.Header[http.PHeaderOrderKey] = chromePseudoHeaderOrder
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
 	req.Header.Set("User-Agent", CurrentChromeUA)
+	req.Header.Set("sec-ch-ua", CurrentSecChUa)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("sec-ch-ua-platform", CurrentPlatform)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9,th;q=0.8")
 	req.Header.Set("Origin", "https://gemini.google.com")
 	req.Header.Set("Referer", fmt.Sprintf("https://gemini.google.com%s/app", c.getAccountPrefix()))
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Priority", "u=1, i")
 	req.Header.Set("X-Same-Domain", "1")
 	jspbVal := modelCfg.BuildHeaderValue()
 	log.Printf("📡 [sendRequestHTTP2] model=%s jspb=%s", modelCfg.ID, jspbVal)
 	req.Header.Set("x-goog-ext-525001261-jspb", jspbVal)
-	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
+	req.Header.Set("x-goog-ext-525005358-jspb", fmt.Sprintf(`["%s",1]`, c.getSessionUUID()))
 	req.Header.Set("x-goog-ext-73010989-jspb", modelCfg.BuildModeHeaderValue())
+	req.Header.Set("x-goog-ext-73010990-jspb", `[0]`)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -1304,19 +1410,80 @@ func (c *GeminiClient) sendRequestHTTP2(fullURL string, data url.Values, modelCf
 	return string(bodyBytes), nil
 }
 
+func extractGoogleRPCError(item []interface{}) int {
+	if len(item) <= 5 {
+		return 0
+	}
+	l5, ok := item[5].([]interface{})
+	if !ok || len(l5) <= 2 {
+		return 0
+	}
+	l2, ok := l5[2].([]interface{})
+	if !ok || len(l2) == 0 {
+		return 0
+	}
+	l0, ok := l2[0].([]interface{})
+	if !ok || len(l0) <= 1 {
+		return 0
+	}
+	l1, ok := l0[1].([]interface{})
+	if !ok || len(l1) == 0 {
+		return 0
+	}
+	switch v := l1[0].(type) {
+	case float64:
+		if v > 0 {
+			return int(v)
+		}
+	case int:
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
+}
+
+func mapGoogleRPCError(code int) error {
+	switch code {
+	case 1037:
+		return fmt.Errorf("429 rate limit exceeded (Google RPC error 1037)")
+	case 1050, 1060:
+		return fmt.Errorf("429 model unavailable or restricted (Google RPC error %d)", code)
+	case 1013, 1052:
+		return fmt.Errorf("invalid request (Google RPC error %d)", code)
+	default:
+		return fmt.Errorf("Google RPC error %d", code)
+	}
+}
+
 func parseResponse(raw string, res *GeminiResponse) {
+	parseResponseWithError(raw, res)
+}
+
+func parseResponseWithError(raw string, res *GeminiResponse) int {
+	var rpcErrCode int
 	lines := strings.Split(raw, "\n")
 	for _, line := range lines {
-		if !strings.HasPrefix(line, "[[") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "[[") {
 			continue
 		}
 
-		var wrapper [][]interface{}
-		if err := json.Unmarshal([]byte(line), &wrapper); err != nil {
+		var wrapper []interface{}
+		if err := json.Unmarshal([]byte(trimmed), &wrapper); err != nil {
 			continue
 		}
 
-		for _, item := range wrapper {
+		for _, rawItem := range wrapper {
+			item, ok := rawItem.([]interface{})
+			if !ok {
+				continue
+			}
+
+			if code := extractGoogleRPCError(item); code > 0 && rpcErrCode == 0 {
+				rpcErrCode = code
+			}
+
 			if len(item) < 3 {
 				continue
 			}
@@ -1349,10 +1516,23 @@ func parseResponse(raw string, res *GeminiResponse) {
 			if len(inner) > 4 {
 				if contentArr, ok := inner[4].([]interface{}); ok && len(contentArr) > 0 {
 					if msgItem, ok := contentArr[0].([]interface{}); ok && len(msgItem) > 1 {
+						var text string
 						if contentList, ok := msgItem[1].([]interface{}); ok && len(contentList) > 0 {
-							if text, ok := contentList[0].(string); ok {
-								res.Text = text
+							if t, ok := contentList[0].(string); ok {
+								text = t
 							}
+						}
+						if text == "" || strings.HasPrefix(text, "http://googleusercontent.com/card_content/") || strings.HasPrefix(text, "https://googleusercontent.com/card_content/") {
+							if len(msgItem) > 22 {
+								if cardArr, ok := msgItem[22].([]interface{}); ok && len(cardArr) > 0 {
+									if cardText, ok := cardArr[0].(string); ok && cardText != "" {
+										text = cardText
+									}
+								}
+							}
+						}
+						if text != "" {
+							res.Text = SanitizeGeminiText(text)
 						}
 						if choiceID, ok := msgItem[0].(string); ok {
 							res.ChoiceID = choiceID
@@ -1396,6 +1576,7 @@ func parseResponse(raw string, res *GeminiResponse) {
 			}
 		}
 	}
+	return rpcErrCode
 }
 
 // probeMusicURLs recursively probes nested data for music download URLs
@@ -1544,9 +1725,6 @@ func (c *GeminiClient) ReloadSession() error {
 		return fmt.Errorf("failed to reload cookies: %v", err)
 	}
 
-	// Mark as uninitialized and invalidate session cache so the next request gets fresh tokens
-	c.IsInitialized = false
-	_ = os.Remove(c.getSessionCachePath())
-	log.Println("♻️  Cookies reloaded in memory. Session marked for lazy re-initialization.")
+	log.Println("♻️  Cookies reloaded in memory without disrupting active session.")
 	return nil
 }

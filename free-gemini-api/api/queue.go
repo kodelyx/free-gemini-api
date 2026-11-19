@@ -6,6 +6,7 @@ import (
 	"goapi/db"
 	"goapi/gemini"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,19 +15,38 @@ import (
 	"time"
 )
 
+// isReservedAccount returns true if accountID is listed in GEMINI_RESERVE_ACCOUNTS (comma-separated).
+// Reserved accounts are kept as Pass-2 standby behind frontline workers.
+func isReservedAccount(accountID string) bool {
+	if accountID == "" {
+		return false
+	}
+	raw := strings.TrimSpace(os.Getenv("GEMINI_RESERVE_ACCOUNTS"))
+	if raw == "" {
+		return false
+	}
+	for _, part := range strings.Split(raw, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), accountID) {
+			return true
+		}
+	}
+	return false
+}
+
 // AccountWorker represents an individual Google Account worker in the pool
 type AccountWorker struct {
-	ID            string               `json:"id"`
-	CookiePath    string               `json:"cookie_path"`
-	Client        *gemini.GeminiClient `json:"-"`
-	Tier          string               `json:"tier"` // "free" or "subscription"
-	InFlight      int64                `json:"in_flight"`
-	TotalServed   int64                `json:"total_served"`
-	TotalErrors   int64                `json:"total_errors"`
-	Status        string               `json:"status"` // "active", "busy", "cooldown", "recovering"
-	CooldownUntil time.Time            `json:"cooldown_until"`
-	LastUsed      time.Time            `json:"last_used"`
-	mu            sync.Mutex
+	ID              string               `json:"id"`
+	CookiePath      string               `json:"cookie_path"`
+	Client          *gemini.GeminiClient `json:"-"`
+	Tier            string               `json:"tier"` // "free" or "subscription"
+	InFlight        int64                `json:"in_flight"`
+	TotalServed     int64                `json:"total_served"`
+	TotalErrors     int64                `json:"total_errors"`
+	Consecutive429s int64                `json:"consecutive_429s"`
+	Status          string               `json:"status"` // "active", "busy", "cooldown", "recovering"
+	CooldownUntil   time.Time            `json:"cooldown_until"`
+	LastUsed        time.Time            `json:"last_used"`
+	mu              sync.Mutex
 }
 
 // IsHealthy returns true if the worker is not in cooldown and is ready to accept requests
@@ -95,6 +115,9 @@ func (p *WorkerPool) ReloadPool() {
 		accID := filepath.Base(cFile)
 		accID = strings.TrimPrefix(accID, "account_")
 		accID = strings.TrimSuffix(accID, ".json")
+		if gemini.IsIgnoredAccount(accID) {
+			continue
+		}
 
 		if existing, ok := existingMap[cFile]; ok {
 			// Existing worker — reload session
@@ -207,11 +230,13 @@ func (p *WorkerPool) AcquireWorkerWithTier(ctx context.Context, affinityKey stri
 			continue
 		}
 
-		// If subscription is strictly required, ensure at least one subscription or authenticated worker exists in pool
-		if requiredTier == "subscription" {
+		isPaidTierReq := requiredTier == "subscription" || requiredTier == "ultra"
+
+		// If subscription or ultra is strictly required, ensure at least one paid/authenticated worker exists in pool
+		if isPaidTierReq {
 			hasSubWorker := false
 			for _, w := range p.workers {
-				if w.Tier == "subscription" {
+				if w.Tier == "subscription" || w.Tier == "ultra" {
 					hasSubWorker = true
 					break
 				}
@@ -236,7 +261,7 @@ func (p *WorkerPool) AcquireWorkerWithTier(ctx context.Context, affinityKey stri
 		minCooldownRemaining := 24 * time.Hour
 
 		for _, w := range p.workers {
-			if requiredTier == "subscription" && w.Tier != "subscription" && w.ID == "guest" {
+			if isPaidTierReq && w.Tier != "subscription" && w.Tier != "ultra" && w.ID == "guest" {
 				continue
 			}
 			hasCandidate = true
@@ -260,10 +285,26 @@ func (p *WorkerPool) AcquireWorkerWithTier(ctx context.Context, affinityKey stri
 			}
 			secs := int(minCooldownRemaining.Seconds()) + 1
 			tierName := "free"
-			if requiredTier == "subscription" {
+			if requiredTier == "ultra" {
+				tierName = "ultra"
+			} else if requiredTier == "subscription" {
 				tierName = "subscription"
 			}
 			return nil, fmt.Errorf("rate_limit_exceeded: all %s tier Google accounts reached rate limit / quota. Cooldown active, next worker ready in %ds. Connect more accounts to increase quota", tierName, secs)
+		}
+
+		hasExplicitUltra := false
+		hasExplicitSub := false
+		for _, w := range p.workers {
+			if w.ID == "guest" {
+				continue
+			}
+			if w.Tier == "ultra" {
+				hasExplicitUltra = true
+				hasExplicitSub = true
+			} else if w.Tier == "subscription" {
+				hasExplicitSub = true
+			}
 		}
 
 		// 1. Check Sticky Affinity (if worker matches required tier)
@@ -272,7 +313,11 @@ func (p *WorkerPool) AcquireWorkerWithTier(ctx context.Context, affinityKey stri
 				for _, w := range p.workers {
 					if w.ID == targetID && w.IsHealthy() && atomic.LoadInt64(&w.InFlight) < p.maxConcurrencyPerWorker {
 						// Ensure tier compatibility
-						if requiredTier != "subscription" || w.Tier == "subscription" || w.ID != "guest" {
+						tierOK := !isPaidTierReq || w.Tier == "subscription" || w.Tier == "ultra" || w.ID != "guest"
+						if requiredTier == "ultra" && hasExplicitUltra && w.Tier != "ultra" {
+							tierOK = false
+						}
+						if tierOK {
 							atomic.AddInt64(&w.InFlight, 1)
 							w.mu.Lock()
 							w.LastUsed = time.Now()
@@ -290,63 +335,43 @@ func (p *WorkerPool) AcquireWorkerWithTier(ctx context.Context, affinityKey stri
 		minInFlight := int64(999999)
 		offset := atomic.AddUint64(&p.rrIndex, 1) % uint64(workersCount)
 
-		if requiredTier == "ultra" {
-			// Ultra requests prefer ultra workers if available, otherwise fall back to authenticated subscription workers
-			hasExplicitUltra := false
-			for _, w := range p.workers {
-				if w.Tier == "ultra" && w.ID != "guest" {
-					hasExplicitUltra = true
+		if isPaidTierReq {
+			// Pass 1: Prefer frontline non-reserved workers first
+			// Pass 2: Fall back to reserved accounts (GEMINI_RESERVE_ACCOUNTS) if all frontline workers are busy or in cooldown
+			for _, allowReserved := range []bool{false, true} {
+				if bestWorker != nil {
 					break
 				}
-			}
-
-			for i := 0; i < workersCount; i++ {
-				idx := (int(offset) + i) % workersCount
-				w := p.workers[idx]
-				if !w.IsHealthy() || w.ID == "guest" {
-					continue
-				}
-				if hasExplicitUltra && w.Tier != "ultra" {
-					continue
-				}
-				inFlight := atomic.LoadInt64(&w.InFlight)
-				if inFlight < p.maxConcurrencyPerWorker && inFlight < minInFlight {
-					minInFlight = inFlight
-					bestWorker = w
-				}
-			}
-		} else if requiredTier == "subscription" {
-			// Subscription requests accept subscription or ultra workers if present in pool, else any authenticated worker
-			hasExplicitSub := false
-			for _, w := range p.workers {
-				if (w.Tier == "subscription" || w.Tier == "ultra") && w.ID != "guest" {
-					hasExplicitSub = true
-					break
-				}
-			}
-
-			for i := 0; i < workersCount; i++ {
-				idx := (int(offset) + i) % workersCount
-				w := p.workers[idx]
-				if !w.IsHealthy() || w.ID == "guest" {
-					continue
-				}
-				if hasExplicitSub && w.Tier != "subscription" && w.Tier != "ultra" {
-					continue
-				}
-				inFlight := atomic.LoadInt64(&w.InFlight)
-				if inFlight < p.maxConcurrencyPerWorker && inFlight < minInFlight {
-					minInFlight = inFlight
-					bestWorker = w
+				for i := 0; i < workersCount; i++ {
+					idx := (int(offset) + i) % workersCount
+					w := p.workers[idx]
+					if !w.IsHealthy() || w.ID == "guest" {
+						continue
+					}
+					if !allowReserved && isReservedAccount(w.ID) {
+						continue
+					}
+					if requiredTier == "ultra" && hasExplicitUltra {
+						if w.Tier != "ultra" {
+							continue
+						}
+					} else if hasExplicitSub && w.Tier != "subscription" && w.Tier != "ultra" {
+						continue
+					}
+					inFlight := atomic.LoadInt64(&w.InFlight)
+					if inFlight < p.maxConcurrencyPerWorker && inFlight < minInFlight {
+						minInFlight = inFlight
+						bestWorker = w
+					}
 				}
 			}
 		} else {
-			// Free requests:
-			// Pass 1: Prefer free authenticated workers
+			// Free / General requests:
+			// Pass 1: Prefer free authenticated workers (non-reserved, non-guest)
 			for i := 0; i < workersCount; i++ {
 				idx := (int(offset) + i) % workersCount
 				w := p.workers[idx]
-				if !w.IsHealthy() || w.Tier != "free" || w.ID == "guest" {
+				if !w.IsHealthy() || w.Tier != "free" || w.ID == "guest" || isReservedAccount(w.ID) {
 					continue
 				}
 				inFlight := atomic.LoadInt64(&w.InFlight)
@@ -356,7 +381,23 @@ func (p *WorkerPool) AcquireWorkerWithTier(ctx context.Context, affinityKey stri
 				}
 			}
 
-			// Pass 2: If free authenticated workers busy or absent, allow healthy subscription workers
+			// Pass 2: Prefer frontline subscription workers (non-reserved, non-guest)
+			if bestWorker == nil {
+				for i := 0; i < workersCount; i++ {
+					idx := (int(offset) + i) % workersCount
+					w := p.workers[idx]
+					if !w.IsHealthy() || w.ID == "guest" || isReservedAccount(w.ID) {
+						continue
+					}
+					inFlight := atomic.LoadInt64(&w.InFlight)
+					if inFlight < p.maxConcurrencyPerWorker && inFlight < minInFlight {
+						minInFlight = inFlight
+						bestWorker = w
+					}
+				}
+			}
+
+			// Pass 3: If frontline workers are busy or in cooldown, allow reserved accounts
 			if bestWorker == nil {
 				for i := 0; i < workersCount; i++ {
 					idx := (int(offset) + i) % workersCount
@@ -372,7 +413,7 @@ func (p *WorkerPool) AcquireWorkerWithTier(ctx context.Context, affinityKey stri
 				}
 			}
 
-			// Pass 3: Fall back to guest worker if no authenticated workers available or all on cooldown
+			// Pass 4: Fall back to guest worker if no authenticated workers available or all on cooldown
 			if bestWorker == nil {
 				for i := 0; i < workersCount; i++ {
 					idx := (int(offset) + i) % workersCount
@@ -392,6 +433,7 @@ func (p *WorkerPool) AcquireWorkerWithTier(ctx context.Context, affinityKey stri
 		if bestWorker != nil {
 			atomic.AddInt64(&bestWorker.InFlight, 1)
 			bestWorker.mu.Lock()
+			sinceLast := time.Since(bestWorker.LastUsed)
 			bestWorker.LastUsed = time.Now()
 			bestWorker.mu.Unlock()
 
@@ -399,6 +441,12 @@ func (p *WorkerPool) AcquireWorkerWithTier(ctx context.Context, affinityKey stri
 				p.affinityMap.Store(affinityKey, bestWorker.ID)
 			}
 			p.mu.RUnlock()
+
+			// Human Micro-Jitter: if the same account is hit consecutively within < 1s, pause 150-350ms
+			if sinceLast < time.Second {
+				jitterMs := 150 + rand.Intn(201)
+				time.Sleep(time.Duration(jitterMs) * time.Millisecond)
+			}
 			return bestWorker, nil
 		}
 
@@ -421,6 +469,7 @@ func (p *WorkerPool) ReleaseWorker(worker *AccountWorker, err error) {
 
 	if err == nil {
 		atomic.AddInt64(&worker.TotalServed, 1)
+		worker.Consecutive429s = 0
 		worker.Status = "active"
 		_ = db.RecordAccountUsage(worker.ID, worker.CookiePath, "active", worker.Tier)
 		return
@@ -441,9 +490,16 @@ func (p *WorkerPool) ReleaseWorker(worker *AccountWorker, err error) {
 		strings.Contains(errStr, "unauthorized")
 
 	if isRateLimit {
+		worker.Consecutive429s++
+		cooldownDur := 60 * time.Second
+		if worker.Consecutive429s == 2 {
+			cooldownDur = 180 * time.Second
+		} else if worker.Consecutive429s >= 3 {
+			cooldownDur = 600 * time.Second
+		}
 		worker.Status = "cooldown"
-		worker.CooldownUntil = time.Now().Add(60 * time.Second)
-		log.Printf("⏳ [WorkerPool] Worker [%s] (Tier: %s) rate limited (429/quota). In cooldown for 60s.", worker.ID, worker.Tier)
+		worker.CooldownUntil = time.Now().Add(cooldownDur)
+		log.Printf("⏳ [WorkerPool] Worker [%s] (Tier: %s) rate limited (429/quota, streak=%d). In cooldown for %v.", worker.ID, worker.Tier, worker.Consecutive429s, cooldownDur)
 		_ = db.RecordAccountUsage(worker.ID, worker.CookiePath, "rate_limited", worker.Tier)
 	} else if isAuthOrExpiry {
 		worker.Status = "recovering"
@@ -465,7 +521,7 @@ func (p *WorkerPool) ExecuteQueued(ctx context.Context, affinityKey string, op f
 
 // ExecuteQueuedWithTier handles request execution with specific tier requirement
 func (p *WorkerPool) ExecuteQueuedWithTier(ctx context.Context, affinityKey string, requiredTier string, op func(w *AccountWorker) (*gemini.GeminiResponse, error)) (*gemini.GeminiResponse, error) {
-	maxAttempts := 3
+	maxAttempts := 5
 	p.mu.RLock()
 	availableCount := len(p.workers)
 	p.mu.RUnlock()

@@ -10,6 +10,7 @@ let lastSyncTime = null;
 let hasSyncedOnce = false;
 let syncDebounceTimeout = null;
 let isDiscovering = false;
+let lastCookiePayload = '';
 
 chrome.runtime.onInstalled.addListener(init);
 chrome.runtime.onStartup.addListener(init);
@@ -242,6 +243,11 @@ function getFormattedCookies(callback) {
 async function performSync() {
   const host = await getServerHost();
   getFormattedCookies((formatted) => {
+    const currentPayload = JSON.stringify(formatted);
+    if (currentPayload === lastCookiePayload) {
+      return;
+    }
+    lastCookiePayload = currentPayload;
     // If WebSocket is ready, push via WebSocket
     if (ws && ws.readyState === WebSocket.OPEN) {
       console.log(`[Gemini Sync] Synchronized ${formatted.length} essential cookies via WebSocket to ${host}`);
