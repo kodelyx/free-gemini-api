@@ -612,7 +612,7 @@ func (c *GeminiClient) doStreamRequestQUIC(fullURL string, data url.Values, mode
 	log.Printf("📡 [Request] model=%s jspb=%s", modelCfg.ID, jspbVal)
 	req.Header.Set("x-goog-ext-525001261-jspb", jspbVal)
 	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
-	req.Header.Set("x-goog-ext-73010989-jspb", `[0]`)
+	req.Header.Set("x-goog-ext-73010989-jspb", modelCfg.BuildModeHeaderValue())
 	if c.RawCookies != "" {
 		req.Header.Set("Cookie", c.RawCookies)
 	}
@@ -652,7 +652,7 @@ func (c *GeminiClient) doStreamRequestHTTP2(fullURL string, data url.Values, mod
 	log.Printf("📡 [HTTP2-Request] model=%s jspb=%s", modelCfg.ID, jspbVal2)
 	req.Header.Set("x-goog-ext-525001261-jspb", jspbVal2)
 	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
-	req.Header.Set("x-goog-ext-73010989-jspb", `[0]`)
+	req.Header.Set("x-goog-ext-73010989-jspb", modelCfg.BuildModeHeaderValue())
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -1239,7 +1239,7 @@ func (c *GeminiClient) sendRequestQUIC(fullURL string, data url.Values, modelCfg
 	log.Printf("📡 [sendRequestQUIC] model=%s jspb=%s", modelCfg.ID, jspbVal)
 	req.Header.Set("x-goog-ext-525001261-jspb", jspbVal)
 	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
-	req.Header.Set("x-goog-ext-73010989-jspb", `[0]`)
+	req.Header.Set("x-goog-ext-73010989-jspb", modelCfg.BuildModeHeaderValue())
 	if c.RawCookies != "" {
 		req.Header.Set("Cookie", c.RawCookies)
 	}
@@ -1283,7 +1283,7 @@ func (c *GeminiClient) sendRequestHTTP2(fullURL string, data url.Values, modelCf
 	log.Printf("📡 [sendRequestHTTP2] model=%s jspb=%s", modelCfg.ID, jspbVal)
 	req.Header.Set("x-goog-ext-525001261-jspb", jspbVal)
 	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
-	req.Header.Set("x-goog-ext-73010989-jspb", `[0]`)
+	req.Header.Set("x-goog-ext-73010989-jspb", modelCfg.BuildModeHeaderValue())
 
 	resp, err := c.client.Do(req)
 	if err != nil {

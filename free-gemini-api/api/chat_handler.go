@@ -126,6 +126,11 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 	}
 
 	modelCfg := gemini.GetModelRegistry().Resolve(reqModel)
+	if strings.EqualFold(c.Get("X-Gemini-Mode"), "task") || strings.EqualFold(c.Query("mode"), "task") || strings.HasSuffix(strings.ToLower(reqModel), "-task") {
+		cfgCopy := *modelCfg
+		cfgCopy.AppMode = 40
+		modelCfg = &cfgCopy
+	}
 	model := modelCfg.ID
 	requiredTier := modelCfg.MinTier
 	pool := GetWorkerPool()
@@ -318,6 +323,11 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	}
 
 	modelCfg := gemini.GetModelRegistry().Resolve(req.Model)
+	if strings.EqualFold(c.Get("X-Gemini-Mode"), "task") || strings.EqualFold(c.Query("mode"), "task") || strings.HasSuffix(strings.ToLower(req.Model), "-task") {
+		cfgCopy := *modelCfg
+		cfgCopy.AppMode = 40
+		modelCfg = &cfgCopy
+	}
 	model := modelCfg.ID
 	requiredTier := modelCfg.MinTier
 

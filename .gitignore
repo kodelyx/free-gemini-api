@@ -3,6 +3,7 @@
 *.so
 *.dll
 *.exe
+goapi
 gemini-mcp
 gemini-api
 gemini-core

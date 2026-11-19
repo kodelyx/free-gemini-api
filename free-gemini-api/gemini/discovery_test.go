@@ -67,18 +67,18 @@ func TestDiscoverModelsFromHTML(t *testing.T) {
 	foundPro := false
 	foundFlash := false
 	for _, m := range discovered {
-		if m.ID == "gemini-3.1-pro" && m.MinTier == "subscription" {
+		if (m.ID == "gemini-4-neon" || m.ID == "gemini-3.1-pro") && m.MinTier == "subscription" {
 			foundPro = true
 		}
-		if m.ID == "gemini-3.8-flash" && m.MinTier == "free" {
+		if (m.ID == "gemini-4-hydrogen" || m.ID == "gemini-3.8-flash") && m.MinTier == "free" {
 			foundFlash = true
 		}
 	}
 
 	if !foundPro {
-		t.Errorf("Did not discover gemini-3.1-pro with subscription tier")
+		t.Errorf("Did not discover gemini-4-neon / gemini-3.1-pro with subscription tier")
 	}
 	if !foundFlash {
-		t.Errorf("Did not discover gemini-3.8-flash with free tier")
+		t.Errorf("Did not discover gemini-4-hydrogen / gemini-3.8-flash with free tier")
 	}
 }

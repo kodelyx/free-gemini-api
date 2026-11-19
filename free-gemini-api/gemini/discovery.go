@@ -15,11 +15,27 @@ var (
 	// Known mode hashes mapped to metadata
 	knownModelSignatures = map[string]ModelConfig{
 		"56fdd199312815e2": {
-			ID:          "gemini-3.8-flash",
-			DisplayName: "Google Gemini 3.8 Flash",
+			ID:          "gemini-4-hydrogen",
+			DisplayName: "Google Gemini 4 Hydrogen",
 			ModeID:      "56fdd199312815e2",
 			MinTier:     "free",
-			Aliases:     []string{"gemini-flash", "flash"},
+			Aliases:     []string{"4-hydrogen", "hydrogen", "gemini-3.8-flash", "gemini-flash", "flash"},
+			Source:      "discovered",
+		},
+		"e6fa609c3fa255c0": {
+			ID:          "gemini-4-neon",
+			DisplayName: "Google Gemini 4 Neon",
+			ModeID:      "e6fa609c3fa255c0",
+			MinTier:     "subscription",
+			Aliases:     []string{"4-neon", "neon", "gemini-3.1-pro", "gemini-pro", "pro", "advanced"},
+			Source:      "discovered",
+		},
+		"8c46e95b1a07cecc": {
+			ID:          "gemini-auto",
+			DisplayName: "Google Gemini Auto",
+			ModeID:      "8c46e95b1a07cecc",
+			MinTier:     "free",
+			Aliases:     []string{"auto", "gemini-3.5-flash-lite", "3.5-flash-lite", "flash-lite", "lite"},
 			Source:      "discovered",
 		},
 		"95a4c0abcba24364": {
@@ -28,22 +44,6 @@ var (
 			ModeID:      "95a4c0abcba24364",
 			MinTier:     "free",
 			Aliases:     []string{"4-argon", "argon", "gemini-argon"},
-			Source:      "discovered",
-		},
-		"e6fa609c3fa255c0": {
-			ID:          "gemini-3.1-pro",
-			DisplayName: "Google Gemini 3.1 Pro",
-			ModeID:      "e6fa609c3fa255c0",
-			MinTier:     "subscription",
-			Aliases:     []string{"gemini-pro", "pro", "advanced"},
-			Source:      "discovered",
-		},
-		"8c46e95b1a07cecc": {
-			ID:          "gemini-3.5-flash-lite",
-			DisplayName: "Google Gemini 3.5 Flash-Lite",
-			ModeID:      "8c46e95b1a07cecc",
-			MinTier:     "free",
-			Aliases:     []string{"3.5-flash-lite", "flash-lite", "gemini-flash-lite", "gemini-lite", "lite"},
 			Source:      "discovered",
 		},
 		// Legacy / alternative hashes
@@ -77,9 +77,18 @@ var (
 	hexModeRegex = regexp.MustCompile(`["']([a-f0-9]{16})["']`)
 )
 
-// DetectAccountTier scans HTML payload and filename to detect if account has Gemini Advanced / Subscription
+// DetectAccountTier scans HTML payload and filename to detect if account has Gemini Ultra, Advanced / Subscription, or Free tier
 func DetectAccountTier(htmlContent string, cookieFileName string) string {
 	lowerHTML := strings.ToLower(htmlContent)
+	base := strings.ToLower(filepath.Base(cookieFileName))
+
+	// Check explicit Ultra tier signals
+	if strings.Contains(lowerHTML, `"is_ultra":true`) ||
+		strings.Contains(lowerHTML, `gemini-ultra`) ||
+		strings.Contains(lowerHTML, `mode_category_ultra`) ||
+		strings.Contains(base, "ultra") {
+		return "ultra"
+	}
 
 	// Check explicit subscription signals in Google frontend payload
 	// Note: explore-plan/gemini-advanced is an upgrade promo URL shown to free users
@@ -91,7 +100,6 @@ func DetectAccountTier(htmlContent string, cookieFileName string) string {
 	}
 
 	// Filename fallback convention (e.g. account_pro.json, sub_account.json)
-	base := strings.ToLower(filepath.Base(cookieFileName))
 	if strings.Contains(base, "pro") || strings.Contains(base, "sub") || strings.Contains(base, "advanced") {
 		return "subscription"
 	}

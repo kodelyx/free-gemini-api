@@ -290,11 +290,36 @@ func (p *WorkerPool) AcquireWorkerWithTier(ctx context.Context, affinityKey stri
 		minInFlight := int64(999999)
 		offset := atomic.AddUint64(&p.rrIndex, 1) % uint64(workersCount)
 
-		if requiredTier == "subscription" {
-			// Subscription requests strictly require subscription workers if present in pool, else any authenticated worker
+		if requiredTier == "ultra" {
+			// Ultra requests prefer ultra workers if available, otherwise fall back to authenticated subscription workers
+			hasExplicitUltra := false
+			for _, w := range p.workers {
+				if w.Tier == "ultra" && w.ID != "guest" {
+					hasExplicitUltra = true
+					break
+				}
+			}
+
+			for i := 0; i < workersCount; i++ {
+				idx := (int(offset) + i) % workersCount
+				w := p.workers[idx]
+				if !w.IsHealthy() || w.ID == "guest" {
+					continue
+				}
+				if hasExplicitUltra && w.Tier != "ultra" {
+					continue
+				}
+				inFlight := atomic.LoadInt64(&w.InFlight)
+				if inFlight < p.maxConcurrencyPerWorker && inFlight < minInFlight {
+					minInFlight = inFlight
+					bestWorker = w
+				}
+			}
+		} else if requiredTier == "subscription" {
+			// Subscription requests accept subscription or ultra workers if present in pool, else any authenticated worker
 			hasExplicitSub := false
 			for _, w := range p.workers {
-				if w.Tier == "subscription" && w.ID != "guest" {
+				if (w.Tier == "subscription" || w.Tier == "ultra") && w.ID != "guest" {
 					hasExplicitSub = true
 					break
 				}
@@ -306,7 +331,7 @@ func (p *WorkerPool) AcquireWorkerWithTier(ctx context.Context, affinityKey stri
 				if !w.IsHealthy() || w.ID == "guest" {
 					continue
 				}
-				if hasExplicitSub && w.Tier != "subscription" {
+				if hasExplicitSub && w.Tier != "subscription" && w.Tier != "ultra" {
 					continue
 				}
 				inFlight := atomic.LoadInt64(&w.InFlight)

@@ -18,11 +18,21 @@ type ModelConfig struct {
 	ModeID         string   `json:"mode_id"`         // Internal hex hash (e.g. 56fdd199312815e2)
 	HeaderTemplate string   `json:"header_template"` // JSPB template string
 	ThinkingLevel  int      `json:"thinking_level,omitempty"`
+	AppMode        int      `json:"app_mode,omitempty"` // 0 = Chat Mode (default), 40 = Task Mode
 	MinTier        string   `json:"min_tier"`        // "free" or "subscription"
 	Aliases        []string `json:"aliases,omitempty"`
 	Capabilities   []string `json:"capabilities,omitempty"`
 	IsDefault      bool     `json:"is_default"`
 	Source         string   `json:"source"` // "builtin", "discovered", "custom"
+}
+
+// BuildModeHeaderValue constructs the x-goog-ext-73010989-jspb header value.
+// Chat Mode sends [0], Task Mode sends [40] (verified via live CDP).
+func (m *ModelConfig) BuildModeHeaderValue() string {
+	if m != nil && m.AppMode == 40 {
+		return `[40]`
+	}
+	return `[0]`
 }
 
 // BuildHeaderValue constructs the x-goog-ext-525001261-jspb header value.
@@ -81,6 +91,119 @@ var (
 
 // Default models catalog
 var defaultBuiltinModels = []ModelConfig{
+	{
+		ID:             "gemini-4-hydrogen",
+		DisplayName:    "Google Gemini 4 Hydrogen",
+		Description:    "Everyday help — balanced multi-modal flagship (Default)",
+		ModeID:         "56fdd199312815e2",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,0,[4],null,null,2]`,
+		MinTier:        "free",
+		Aliases:        []string{"4-hydrogen", "hydrogen", "everyday-help", "gemini-hydrogen"},
+		Capabilities:   []string{"chat", "stream", "vision", "video", "tools"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
+	{
+		ID:             "gemini-4-hydrogen-task",
+		DisplayName:    "Google Gemini 4 Hydrogen (Task Mode)",
+		Description:    "Everyday help with agentic task execution and workflow guidance",
+		ModeID:         "56fdd199312815e2",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,0,[4],null,null,2]`,
+		AppMode:        40,
+		MinTier:        "free",
+		Aliases:        []string{"hydrogen-task", "4-hydrogen-task", "everyday-task"},
+		Capabilities:   []string{"chat", "stream", "task", "workflow"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
+	{
+		ID:             "gemini-4-neon",
+		DisplayName:    "Google Gemini 4 Neon",
+		Description:    "Deeper analysis — complex coding, deep logic, and multi-turn problem solving",
+		ModeID:         "e6fa609c3fa255c0",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,0,[4],null,null,2]`,
+		MinTier:        "subscription",
+		Aliases:        []string{"4-neon", "neon", "deeper-analysis", "gemini-neon"},
+		Capabilities:   []string{"chat", "stream", "vision", "tools", "complex_reasoning"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
+	{
+		ID:             "gemini-4-neon-task",
+		DisplayName:    "Google Gemini 4 Neon (Task Mode)",
+		Description:    "Deeper analysis with advanced agentic planning and task execution",
+		ModeID:         "e6fa609c3fa255c0",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,0,[4],null,null,2]`,
+		AppMode:        40,
+		MinTier:        "subscription",
+		Aliases:        []string{"neon-task", "4-neon-task"},
+		Capabilities:   []string{"chat", "stream", "task", "workflow", "complex_reasoning"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
+	{
+		ID:             "gemini-4-neon-thinking-high",
+		DisplayName:    "Google Gemini 4 Neon (Thinking High)",
+		Description:    "Deeper analysis with extra thorough thinking depth (High=2)",
+		ModeID:         "e6fa609c3fa255c0",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,null,[4,5,6,8,16,19,20],null,null,null,null,null,8,%d,null,null,null,null]`,
+		ThinkingLevel:  2,
+		MinTier:        "subscription",
+		Aliases:        []string{"neon-thinking-high", "neon-high"},
+		Capabilities:   []string{"chat", "stream", "thinking", "math", "code", "complex_tasks"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
+	{
+		ID:             "gemini-4-neon-thinking-medium",
+		DisplayName:    "Google Gemini 4 Neon (Thinking Medium)",
+		Description:    "Deeper analysis with balanced thinking depth (Medium=4)",
+		ModeID:         "e6fa609c3fa255c0",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,null,[4,5,6,8,16,19,20],null,null,null,null,null,8,%d,null,null,null,null]`,
+		ThinkingLevel:  4,
+		MinTier:        "subscription",
+		Aliases:        []string{"neon-thinking-medium", "neon-medium"},
+		Capabilities:   []string{"chat", "stream", "thinking", "math", "code", "complex_tasks"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
+	{
+		ID:             "gemini-4-neon-thinking-low",
+		DisplayName:    "Google Gemini 4 Neon (Thinking Low)",
+		Description:    "Deeper analysis with fast and efficient thinking (Low=1)",
+		ModeID:         "e6fa609c3fa255c0",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,null,[4,5,6,8,16,19,20],null,null,null,null,null,8,%d,null,null,null,null]`,
+		ThinkingLevel:  1,
+		MinTier:        "subscription",
+		Aliases:        []string{"neon-thinking-low", "neon-low"},
+		Capabilities:   []string{"chat", "stream", "thinking", "math", "code", "complex_tasks"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
+	{
+		ID:             "gemini-auto",
+		DisplayName:    "Google Gemini Auto",
+		Description:    "Auto — adapts model and reasoning to your needs",
+		ModeID:         "8c46e95b1a07cecc",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,0,[4],null,null,2]`,
+		MinTier:        "free",
+		Aliases:        []string{"auto", "gemini-auto"},
+		Capabilities:   []string{"chat", "stream", "vision", "tools", "fastest"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
+	{
+		ID:             "gemini-4-carbon",
+		DisplayName:    "Google Gemini 4 Carbon",
+		Description:    "Long-horizon deep reasoning and autonomous execution (Ultra Tier)",
+		ModeID:         "f44d2958d1f0189a",
+		HeaderTemplate: `[1,null,null,null,"%s",null,null,0,[4],null,null,2]`,
+		MinTier:        "ultra",
+		Aliases:        []string{"4-carbon", "carbon", "gemini-carbon"},
+		Capabilities:   []string{"chat", "stream", "deep_reasoning", "tools", "frontier"},
+		IsDefault:      false,
+		Source:         "builtin",
+	},
 	{
 		ID:             "gemini-3.5-flash-lite",
 		DisplayName:    "Google Gemini 3.5 Flash-Lite",
@@ -357,6 +480,46 @@ func (r *ModelRegistry) Resolve(name string) *ModelConfig {
 	}
 
 	// 3. Substring matching for convenience
+	if strings.Contains(clean, "neon") {
+		if strings.Contains(clean, "high") || strings.Contains(clean, "3") {
+			if m, ok := r.models["gemini-4-neon-thinking-high"]; ok {
+				return m
+			}
+		}
+		if strings.Contains(clean, "med") || strings.Contains(clean, "4") {
+			if m, ok := r.models["gemini-4-neon-thinking-medium"]; ok {
+				return m
+			}
+		}
+		if strings.Contains(clean, "low") || strings.Contains(clean, "1") {
+			if m, ok := r.models["gemini-4-neon-thinking-low"]; ok {
+				return m
+			}
+		}
+		if strings.Contains(clean, "task") {
+			if m, ok := r.models["gemini-4-neon-task"]; ok {
+				return m
+			}
+		}
+		if m, ok := r.models["gemini-4-neon"]; ok {
+			return m
+		}
+	}
+	if strings.Contains(clean, "hydrogen") {
+		if strings.Contains(clean, "task") {
+			if m, ok := r.models["gemini-4-hydrogen-task"]; ok {
+				return m
+			}
+		}
+		if m, ok := r.models["gemini-4-hydrogen"]; ok {
+			return m
+		}
+	}
+	if strings.Contains(clean, "auto") {
+		if m, ok := r.models["gemini-auto"]; ok {
+			return m
+		}
+	}
 	if strings.Contains(clean, "argon") {
 		if strings.Contains(clean, "high") || strings.Contains(clean, "3") {
 			if m, ok := r.models["gemini-4-argon-thinking-high"]; ok {
@@ -374,6 +537,11 @@ func (r *ModelRegistry) Resolve(name string) *ModelConfig {
 			}
 		}
 		if m, ok := r.models["gemini-4-argon"]; ok {
+			return m
+		}
+	}
+	if strings.Contains(clean, "carbon") {
+		if m, ok := r.models["gemini-4-carbon"]; ok {
 			return m
 		}
 	}

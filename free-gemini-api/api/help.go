@@ -16,7 +16,7 @@ BASE URL:
 
 CORE API ENDPOINTS:
   POST /v1/chat/completions   OpenAI-compatible chat & streaming completions
-  GET  /v1/models             List dynamic models (gemini-3.8-flash [Default], gemini-4-argon, gemini-3.1-pro)
+  GET  /v1/models             List dynamic models (gemini-4-hydrogen [Default], gemini-4-neon, gemini-auto, etc.)
   POST /v1/models             Register custom models & mode hashes at runtime
   POST /v1/models/discover    Autonomous model & tier discovery across connected accounts
   GET  /v1/workers            Live worker pool metrics, active accounts & throughput
@@ -32,13 +32,16 @@ CORE API ENDPOINTS:
   POST /reset                 Reset an active agent/user session
   GET  /help                  Display this CLI developer manual
 
-MULTI-AGENT HEADERS:
+MULTI-AGENT & TASK MODE HEADERS:
+  X-Gemini-Mode: task         Execute in Task Mode (sends [40] JSPB instead of [0])
   X-Agent-ID: <id>            Sticky affinity binding (Keeps agent thread with same account)
   X-Session-ID: <id>          Custom session identifier
   X-Conversation-ID: <id>     Gemini server-side thread continuation
 
 BUILT-IN TOOLS & CAPABILITIES:
-  * Gemini 4 Argon & Thinking Native deep reasoning (High=2, Medium=4, Low=1)
+  * Gemini 4 Hydrogen (Everyday help flagship, 100% Free)
+  * Gemini 4 Neon & Thinking (Deeper analysis with High=2, Medium=4, Low=1)
+  * Chat vs Task Mode         Dynamic segment switching (Chat: [0], Task: [40])
   * Arranger Engine           Native OpenAI Tool / Function calling & Output Sanitizer
   * Multi-Account Queue       Auto load balancing across 1 to 100+ accounts with circuit breaker
   * HTTP/3 QUIC & TLS         Chrome 152 JA4 fingerprint simulation with 0-RTT resumption
@@ -48,15 +51,21 @@ BUILT-IN TOOLS & CAPABILITIES:
 
 SAMPLE USAGE:
 
-  # 1. Quick Chat Completion (Default Model: gemini-3.8-flash):
+  # 1. Quick Chat Completion (Default Model: gemini-4-hydrogen):
   curl -s -X POST http://127.0.0.1:8001/v1/chat/completions \
     -H "Content-Type: application/json" \
-    -d '{"model": "gemini-3.8-flash", "messages": [{"role": "user", "content": "Explain quantum computing in 1 line."}]}'
+    -d '{"model": "gemini-4-hydrogen", "messages": [{"role": "user", "content": "Explain quantum computing in 1 line."}]}'
 
-  # 2. Frontier Deep Thinking (Gemini 4 Argon High):
+  # 2. Deeper Analysis with Deep Thinking (Gemini 4 Neon High):
   curl -s -X POST http://127.0.0.1:8001/v1/chat/completions \
     -H "Content-Type: application/json" \
-    -d '{"model": "argon-high", "messages": [{"role": "user", "content": "Solve this logic puzzle with full step-by-step thinking."}]}'
+    -d '{"model": "neon-high", "messages": [{"role": "user", "content": "Solve this logic puzzle with full step-by-step thinking."}]}'
+
+  # 3. Agentic Task Execution (Task Mode):
+  curl -s -X POST http://127.0.0.1:8001/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "X-Gemini-Mode: task" \
+    -d '{"model": "hydrogen-task", "messages": [{"role": "user", "content": "Create a multi-step checklist for database migration."}]}'
 
   # 3. Multi-Agent Sticky Affinity:
   curl -s -X POST http://127.0.0.1:8001/v1/chat/completions \
@@ -109,13 +118,13 @@ func HandleHelp(c fiber.Ctx) error {
 		return c.JSON(fiber.Map{
 			"service":        "Free Gemini API",
 			"engine":         "HTTP/3 QUIC + Arranger Engine + WorkerPool",
-			"default_model":  "gemini-3.8-flash",
-			"frontier_model": "gemini-4-argon",
+			"default_model":  "gemini-4-hydrogen",
+			"pro_model":      "gemini-4-neon",
 			"port":           8001,
 			"ws_port":        9226,
 			"endpoints": []fiber.Map{
-				{"method": "POST", "path": "/v1/chat/completions", "description": "OpenAI-compatible chat & streaming completions with tool calling (Default: gemini-3.8-flash)"},
-				{"method": "GET", "path": "/v1/models", "description": "List supported models (gemini-3.8-flash [Default], gemini-4-argon [Frontier], gemini-3.1-pro)"},
+				{"method": "POST", "path": "/v1/chat/completions", "description": "OpenAI-compatible chat & streaming completions with tool calling (Default: gemini-4-hydrogen)"},
+				{"method": "GET", "path": "/v1/models", "description": "List supported models (gemini-4-hydrogen [Default], gemini-4-neon [Pro], gemini-auto, gemini-4-argon)"},
 				{"method": "GET", "path": "/v1/workers", "description": "Live worker pool status, active accounts & concurrency"},
 				{"method": "POST", "path": "/chat", "description": "Unified multimodal chat (Text, Images, MP4 screen recordings)"},
 				{"method": "POST", "path": "/music", "description": "AI Music generation via Gemini Lyria"},
